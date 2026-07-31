@@ -56,3 +56,11 @@ properties:
     type: boolean
     description: >
       Invert vertical scrolling.
+
+    velocity-smoothing:
+    type: int
+    default: 40
+    description: >
+      Percentage of the newest input velocity applied each frame.
+      Higher values respond faster. Lower values produce smoother motion.
+      Valid range is 1 to 100.
