@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026 Yuki Isogawa
- *
- * SPDX-License-Identifier: MIT
- */
-
 #define DT_DRV_COMPAT zmk_input_processor_scroll_nurunuru
 
 #include <stdbool.h>
@@ -17,9 +11,6 @@
 #include <zephyr/sys/util.h>
 
 #include <drivers/input_processor.h>
-
-#include <zmk/endpoints.h>
-#include <zmk/hid.h>
 
 LOG_MODULE_REGISTER(
     zmk_scroll_nurunuru,
@@ -62,6 +53,7 @@ struct scroll_nurunuru_config {
 
 struct scroll_nurunuru_data {
     const struct device *dev;
+    const struct device *input_device;
 
     /*
      * Raw movement received during the current frame.
@@ -81,7 +73,7 @@ struct scroll_nurunuru_data {
     int32_t velocity_vertical_fp;
 
     /*
-     * Fractional output retained between HID reports.
+     * Fractional output retained between scroll reports.
      */
     int32_t output_horizontal_fp;
     int32_t output_vertical_fp;
@@ -288,25 +280,60 @@ static int16_t extract_scroll_output(
     return clamp_to_int16(output);
 }
 
-static void send_scroll_report(
+static void send_scroll_events(
+    const struct device *input_device,
     int16_t horizontal,
     int16_t vertical
 ) {
-    if (horizontal == 0 && vertical == 0) {
+    if (input_device == NULL) {
         return;
     }
 
-    zmk_hid_mouse_scroll_set(
-        horizontal,
-        vertical
-    );
+    bool have_horizontal =
+        horizontal != 0;
 
-    zmk_endpoints_send_mouse_report();
+    bool have_vertical =
+        vertical != 0;
 
-    /*
-     * Clear the scroll state so it does not leak into a later mouse report.
-     */
-    zmk_hid_mouse_scroll_set(0, 0);
+    if (!have_horizontal && !have_vertical) {
+        return;
+    }
+
+    int ret;
+
+    if (have_horizontal) {
+        ret = input_report_rel(
+            input_device,
+            INPUT_REL_HWHEEL,
+            horizontal,
+            !have_vertical,
+            K_NO_WAIT
+        );
+
+        if (ret < 0) {
+            LOG_WRN(
+                "Failed to report horizontal scroll: %d",
+                ret
+            );
+        }
+    }
+
+    if (have_vertical) {
+        ret = input_report_rel(
+            input_device,
+            INPUT_REL_WHEEL,
+            vertical,
+            true,
+            K_NO_WAIT
+        );
+
+        if (ret < 0) {
+            LOG_WRN(
+                "Failed to report vertical scroll: %d",
+                ret
+            );
+        }
+    }
 }
 
 static void scroll_nurunuru_work_callback(
@@ -327,6 +354,7 @@ static void scroll_nurunuru_work_callback(
 
     int16_t output_horizontal = 0;
     int16_t output_vertical = 0;
+    const struct device *input_device = NULL;
 
     k_mutex_lock(
         &data->lock,
@@ -507,6 +535,9 @@ static void scroll_nurunuru_work_callback(
         data->velocity_vertical_fp = 0;
     }
 
+    input_device =
+        data->input_device;
+
     LOG_DBG(
         "frame=(%ld,%ld) speed=%ld gain=%ld velocity_fp=(%ld,%ld) output=(%d,%d) remainder_fp=(%ld,%ld) idle=%u",
         (long)frame_horizontal,
@@ -526,7 +557,8 @@ static void scroll_nurunuru_work_callback(
         &data->lock
     );
 
-    send_scroll_report(
+    send_scroll_events(
+        input_device,
         output_horizontal,
         output_vertical
     );
@@ -568,6 +600,9 @@ static int scroll_nurunuru_handle_event(
         &data->lock,
         K_FOREVER
     );
+
+    data->input_device =
+        event->dev;
 
     /*
      * Swap sensor axes for scrolling.
@@ -617,6 +652,7 @@ static int scroll_nurunuru_init(
         dev->data;
 
     data->dev = dev;
+    data->input_device = NULL;
 
     data->pending_horizontal = 0;
     data->pending_vertical = 0;
