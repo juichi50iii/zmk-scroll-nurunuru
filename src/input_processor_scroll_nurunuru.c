@@ -35,6 +35,7 @@ LOG_MODULE_REGISTER(
 #define NURUNURU_ROLLING_FULL_CHARGE_FRAMES 38
 #define NURUNURU_ROLLING_LPF_RESPONSE 12
 #define NURUNURU_ROLLING_CRUISE_RESPONSE 8
+#define NURUNURU_ROLLING_RESPONSE 16
 #define NURUNURU_ROLLING_VELOCITY_RESPONSE 10
 #define NURUNURU_FLICK_VELOCITY_RESPONSE 70
 #define NURUNURU_REVERSE_STOP_MS 150
@@ -46,15 +47,6 @@ LOG_MODULE_REGISTER(
 #define NURUNURU_FLICK_SPEED_THRESHOLD 8
 #define NURUNURU_ROLL_MAX_SPEED 5
 #define NURUNURU_ROLL_MAX_PEAK_SPEED 7
-
-/*
- * Final screen movement scale.
- *
- * 1 / 2 = half distance
- * 1 / 3 = one-third distance
- */
-#define NURUNURU_OUTPUT_SCALE_NUMERATOR 2
-#define NURUNURU_OUTPUT_SCALE_DENOMINATOR 5
 
 enum scroll_nurunuru_gesture_mode {
     NURUNURU_GESTURE_UNDECIDED = 0,
@@ -105,6 +97,13 @@ struct scroll_nurunuru_data {
     int32_t cruise_vertical_fp;
 
     enum scroll_nurunuru_gesture_mode gesture_mode;
+
+    /*
+     * Keep the selected output scale through the inertia tail.
+     * ROLLING uses 1/1; FLICK and undecided/flick-like motion use 2/5.
+     */
+    enum scroll_nurunuru_gesture_mode output_mode;
+
     uint8_t gesture_frames;
     int32_t gesture_peak_speed;
 
@@ -446,6 +445,49 @@ static int32_t calculate_rolling_momentum_target_fp(
     );
 }
 
+static int32_t calculate_rolling_target_fp(
+    int32_t raw_input_fp,
+    uint8_t rolling_frames,
+    uint8_t inertia
+) {
+    uint8_t frames =
+        MIN(
+            rolling_frames,
+            NURUNURU_ROLLING_FULL_CHARGE_FRAMES
+        );
+
+    int32_t progress =
+        (int32_t)(
+            ((int64_t)frames * NURUNURU_GAIN_SCALE) /
+            NURUNURU_ROLLING_FULL_CHARGE_FRAMES
+        );
+
+    int32_t charge =
+        smoothstep_scaled(progress);
+
+    int32_t strength_scaled =
+        ((int32_t)clamp_tuning(inertia) *
+         NURUNURU_GAIN_SCALE *
+         9) /
+        100;
+
+    int64_t target =
+        (int64_t)raw_input_fp *
+        strength_scaled *
+        charge;
+
+    target /=
+        (int64_t)NURUNURU_GAIN_SCALE *
+        NURUNURU_GAIN_SCALE;
+
+    return (int32_t)CLAMP(
+        target,
+        (int64_t)INT32_MIN,
+        (int64_t)INT32_MAX
+    );
+}
+
+
 static enum scroll_nurunuru_gesture_mode classify_gesture(
     enum scroll_nurunuru_gesture_mode current_mode,
     uint8_t gesture_frames,
@@ -702,6 +744,7 @@ static void scroll_nurunuru_work_callback(
         data->hover_horizontal_fp = 0;
         data->rolling_horizontal_direction = 0;
         data->gesture_mode = NURUNURU_GESTURE_UNDECIDED;
+        data->output_mode = NURUNURU_GESTURE_FLICK;
         data->gesture_frames = 0;
         data->gesture_peak_speed = 0;
 
@@ -727,6 +770,7 @@ static void scroll_nurunuru_work_callback(
         data->hover_vertical_fp = 0;
         data->rolling_vertical_direction = 0;
         data->gesture_mode = NURUNURU_GESTURE_UNDECIDED;
+        data->output_mode = NURUNURU_GESTURE_FLICK;
         data->gesture_frames = 0;
         data->gesture_peak_speed = 0;
 
@@ -794,9 +838,6 @@ static void scroll_nurunuru_work_callback(
                 );
         }
 
-        enum scroll_nurunuru_gesture_mode previous_mode =
-            data->gesture_mode;
-
         data->gesture_mode =
             classify_gesture(
                 data->gesture_mode,
@@ -805,9 +846,14 @@ static void scroll_nurunuru_work_callback(
                 data->gesture_peak_speed
             );
 
-        bool just_entered_rolling =
-            previous_mode != NURUNURU_GESTURE_ROLLING &&
-            data->gesture_mode == NURUNURU_GESTURE_ROLLING;
+        /*
+         * Persist the scale choice after release:
+         * rolling keeps full output, everything else uses flick scale.
+         */
+        data->output_mode =
+            data->gesture_mode == NURUNURU_GESTURE_ROLLING
+                ? NURUNURU_GESTURE_ROLLING
+                : NURUNURU_GESTURE_FLICK;
 
         int8_t horizontal_direction =
             sign_i32(frame_horizontal);
@@ -890,102 +936,55 @@ static void scroll_nurunuru_work_callback(
         ) {
             data->hover_active = false;
 
-            /*
-             * Start the rolling engine from the current visible velocity.
-             * This removes the mode-switch step that previously felt jerky.
-             */
-            if (just_entered_rolling) {
-                data->rolling_lpf_horizontal_fp =
-                    data->velocity_horizontal_fp;
-                data->rolling_lpf_vertical_fp =
-                    data->velocity_vertical_fp;
-                data->cruise_horizontal_fp =
-                    data->velocity_horizontal_fp;
-                data->cruise_vertical_fp =
-                    data->velocity_vertical_fp;
-                data->rolling_horizontal_fp = 0;
-                data->rolling_vertical_fp = 0;
-            }
-
-            /* First LPF: hide sensor-level rattling. */
-            data->rolling_lpf_horizontal_fp =
-                smooth_toward(
-                    data->rolling_lpf_horizontal_fp,
-                    raw_horizontal_fp,
-                    NURUNURU_ROLLING_LPF_RESPONSE
-                );
-
-            data->rolling_lpf_vertical_fp =
-                smooth_toward(
-                    data->rolling_lpf_vertical_fp,
-                    raw_vertical_fp,
-                    NURUNURU_ROLLING_LPF_RESPONSE
-                );
-
             int32_t rolling_scale =
                 calculate_rolling_input_scale(
                     data->rolling_frames
                 );
 
-            int32_t cruise_target_horizontal_fp =
+            target_horizontal_fp =
                 apply_gain(
-                    data->rolling_lpf_horizontal_fp,
+                    raw_horizontal_fp,
                     rolling_scale
                 );
 
-            int32_t cruise_target_vertical_fp =
+            target_vertical_fp =
                 apply_gain(
-                    data->rolling_lpf_vertical_fp,
+                    raw_vertical_fp,
                     rolling_scale
                 );
 
-            /* Second LPF: create a stable cruise velocity. */
-            data->cruise_horizontal_fp =
-                smooth_toward(
-                    data->cruise_horizontal_fp,
-                    cruise_target_horizontal_fp,
-                    NURUNURU_ROLLING_CRUISE_RESPONSE
-                );
-
-            data->cruise_vertical_fp =
-                smooth_toward(
-                    data->cruise_vertical_fp,
-                    cruise_target_vertical_fp,
-                    NURUNURU_ROLLING_CRUISE_RESPONSE
-                );
-
-            int32_t momentum_horizontal_target_fp =
-                calculate_rolling_momentum_target_fp(
-                    data->cruise_horizontal_fp,
+            int32_t rolling_horizontal_target_fp =
+                calculate_rolling_target_fp(
+                    raw_horizontal_fp,
+                    data->rolling_frames,
                     get_effective_inertia(config)
                 );
 
-            int32_t momentum_vertical_target_fp =
-                calculate_rolling_momentum_target_fp(
-                    data->cruise_vertical_fp,
+            int32_t rolling_vertical_target_fp =
+                calculate_rolling_target_fp(
+                    raw_vertical_fp,
+                    data->rolling_frames,
                     get_effective_inertia(config)
                 );
 
             data->rolling_horizontal_fp =
                 smooth_toward(
                     data->rolling_horizontal_fp,
-                    momentum_horizontal_target_fp,
-                    6
+                    rolling_horizontal_target_fp,
+                    NURUNURU_ROLLING_RESPONSE
                 );
 
             data->rolling_vertical_fp =
                 smooth_toward(
                     data->rolling_vertical_fp,
-                    momentum_vertical_target_fp,
-                    6
+                    rolling_vertical_target_fp,
+                    NURUNURU_ROLLING_RESPONSE
                 );
 
-            target_horizontal_fp =
-                data->cruise_horizontal_fp +
+            target_horizontal_fp +=
                 data->rolling_horizontal_fp;
 
-            target_vertical_fp =
-                data->cruise_vertical_fp +
+            target_vertical_fp +=
                 data->rolling_vertical_fp;
         } else {
             /*
@@ -1159,19 +1158,43 @@ static void scroll_nurunuru_work_callback(
             idle_ms < NURUNURU_RELEASE_MS
         );
 
+    /*
+     * Mode-specific final screen movement scale.
+     *
+     * ROLLING: 1 / 1
+     * FLICK and its inertia tail: 2 / 5
+     *
+     * Scaling happens before integer HID extraction, so fractional movement
+     * is retained instead of being rounded away.
+     */
+    int32_t scaled_horizontal_velocity_fp =
+        data->velocity_horizontal_fp;
+
+    int32_t scaled_vertical_velocity_fp =
+        data->velocity_vertical_fp;
+
+    if (
+        data->output_mode !=
+        NURUNURU_GESTURE_ROLLING
+    ) {
+        scaled_horizontal_velocity_fp =
+            (int32_t)(
+                ((int64_t)data->velocity_horizontal_fp * 2) /
+                5
+            );
+
+        scaled_vertical_velocity_fp =
+            (int32_t)(
+                ((int64_t)data->velocity_vertical_fp * 2) /
+                5
+            );
+    }
+
     data->output_horizontal_fp +=
-        (int32_t)(
-            ((int64_t)data->velocity_horizontal_fp *
-            NURUNURU_OUTPUT_SCALE_NUMERATOR) /
-            NURUNURU_OUTPUT_SCALE_DENOMINATOR
-        );
+        scaled_horizontal_velocity_fp;
 
     data->output_vertical_fp +=
-        (int32_t)(
-            ((int64_t)data->velocity_vertical_fp *
-            NURUNURU_OUTPUT_SCALE_NUMERATOR) /
-            NURUNURU_OUTPUT_SCALE_DENOMINATOR
-        );
+        scaled_vertical_velocity_fp;
 
     output_horizontal =
         extract_scroll_output(
@@ -1237,6 +1260,8 @@ static void scroll_nurunuru_work_callback(
         data->rolling_vertical_direction = 0;
         data->gesture_mode =
             NURUNURU_GESTURE_UNDECIDED;
+        data->output_mode =
+            NURUNURU_GESTURE_FLICK;
         data->gesture_frames = 0;
         data->gesture_peak_speed = 0;
     }
@@ -1368,6 +1393,8 @@ static int scroll_nurunuru_init(
 
     data->gesture_mode =
         NURUNURU_GESTURE_UNDECIDED;
+    data->output_mode =
+        NURUNURU_GESTURE_FLICK;
     data->gesture_frames = 0;
     data->gesture_peak_speed = 0;
 
