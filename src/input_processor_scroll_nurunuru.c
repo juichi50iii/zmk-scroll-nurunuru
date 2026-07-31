@@ -336,6 +336,8 @@ static int32_t enforce_minimum_cruise(
            minimum_cruise_fp;
 }
 
+static int32_t smoothstep_scaled(int32_t t_scaled);
+
 static uint16_t calculate_rolling_bridge_duration_ms(
     int32_t horizontal_velocity_fp,
     int32_t vertical_velocity_fp
