@@ -1,5 +1,5 @@
 description: >
-  Fixed-rate scrolling input processor for ZMK.
+  Fixed-rate smooth scrolling input processor for ZMK.
 
   The processor consumes relative X and Y input events, accumulates their
   values, and emits horizontal and vertical scroll reports at a fixed
@@ -19,7 +19,7 @@ properties:
     type: boolean
     description: >
       Indicates whether the ZMK input listener should allocate remainder
-      storage for this processor. This processor keeps its own remainders.
+      storage for this processor.
 
   report-interval-ms:
     type: int
@@ -31,14 +31,21 @@ properties:
     type: int
     default: 15
     description: >
-      Raw horizontal movement required to generate one horizontal scroll
-      unit.
+      Raw movement required to generate one horizontal scroll unit.
 
   vertical-divisor:
     type: int
     default: 15
     description: >
-      Raw vertical movement required to generate one vertical scroll unit.
+      Raw movement required to generate one vertical scroll unit.
+
+  velocity-smoothing:
+    type: int
+    default: 40
+    description: >
+      Percentage of the newest input velocity applied each frame.
+      Higher values respond faster. Lower values produce smoother motion.
+      Valid range is 1 to 100.
 
   idle-timeout-ms:
     type: int
@@ -56,11 +63,3 @@ properties:
     type: boolean
     description: >
       Invert vertical scrolling.
-
-    velocity-smoothing:
-    type: int
-    default: 40
-    description: >
-      Percentage of the newest input velocity applied each frame.
-      Higher values respond faster. Lower values produce smoother motion.
-      Valid range is 1 to 100.
