@@ -32,25 +32,46 @@ LOG_MODULE_REGISTER(
 #define NURUNURU_GAIN_SCALE 1000
 
 struct scroll_nurunuru_config {
-    uint16_t report_interval_ms;
-    uint16_t release_ms;
-
-    int16_t horizontal_divisor;
-    int16_t vertical_divisor;
-
-    uint8_t velocity_smoothing;
-
-    uint16_t acceleration_start;
-    uint16_t acceleration_end;
-    uint16_t max_gain_percent;
-
-    uint8_t friction_percent;
-    uint16_t inertia_start_speed;
-    uint16_t inertia_timeout_ms;
+    uint8_t scroll_scale;
+    uint8_t acceleration;
+    uint8_t inertia;
+    uint8_t brake;
 
     bool invert_horizontal;
     bool invert_vertical;
 };
+
+#define NURUNURU_REPORT_INTERVAL_MS 8
+#define NURUNURU_RELEASE_MS 40
+#define NURUNURU_VELOCITY_SMOOTHING 70
+#define NURUNURU_ACCELERATION_START 1
+#define NURUNURU_ACCELERATION_END 10
+#define NURUNURU_SCROLL_SCALE_STEP 24
+
+static uint8_t clamp_tuning(uint8_t value) {
+    return CLAMP(value, 1, 10);
+}
+
+static int16_t get_scroll_divisor(const struct scroll_nurunuru_config *config) {
+    return (int16_t)(NURUNURU_SCROLL_SCALE_STEP * clamp_tuning(config->scroll_scale));
+}
+
+static uint16_t get_max_gain_percent(const struct scroll_nurunuru_config *config) {
+    return (uint16_t)clamp_tuning(config->acceleration) * 100U;
+}
+
+static uint8_t get_friction_percent(const struct scroll_nurunuru_config *config) {
+    int32_t value = 93 + clamp_tuning(config->inertia) - clamp_tuning(config->brake);
+    return (uint8_t)CLAMP(value, 80, 99);
+}
+
+static uint16_t get_inertia_start_speed(const struct scroll_nurunuru_config *config) {
+    return (uint16_t)(11 - clamp_tuning(config->inertia));
+}
+
+static uint16_t get_inertia_timeout_ms(const struct scroll_nurunuru_config *config) {
+    return (uint16_t)(500 + clamp_tuning(config->inertia) * 500);
+}
 
 struct scroll_nurunuru_data {
     const struct device *dev;
@@ -353,6 +374,21 @@ static void scroll_nurunuru_work_callback(
     const struct scroll_nurunuru_config *config =
         data->dev->config;
 
+    const int16_t scroll_divisor =
+        get_scroll_divisor(config);
+
+    const uint16_t max_gain_percent =
+        get_max_gain_percent(config);
+
+    const uint8_t friction_percent =
+        get_friction_percent(config);
+
+    const uint16_t inertia_start_speed =
+        get_inertia_start_speed(config);
+
+    const uint16_t inertia_timeout_ms =
+        get_inertia_timeout_ms(config);
+
     int16_t output_horizontal = 0;
     int16_t output_vertical = 0;
     const struct device *input_device = NULL;
@@ -406,9 +442,9 @@ static void scroll_nurunuru_work_callback(
         gain_scaled =
             calculate_gain_scaled(
                 speed,
-                config->acceleration_start,
-                config->acceleration_end,
-                config->max_gain_percent
+                NURUNURU_ACCELERATION_START,
+                NURUNURU_ACCELERATION_END,
+                max_gain_percent
             );
 
         int32_t accelerated_horizontal =
@@ -426,27 +462,27 @@ static void scroll_nurunuru_work_callback(
         int32_t target_horizontal_fp =
             raw_to_velocity_fp(
                 accelerated_horizontal,
-                config->horizontal_divisor
+                scroll_divisor
             );
 
         int32_t target_vertical_fp =
             raw_to_velocity_fp(
                 accelerated_vertical,
-                config->vertical_divisor
+                scroll_divisor
             );
 
         data->velocity_horizontal_fp =
             smooth_toward(
                 data->velocity_horizontal_fp,
                 target_horizontal_fp,
-                config->velocity_smoothing
+                NURUNURU_VELOCITY_SMOOTHING
             );
 
         data->velocity_vertical_fp =
             smooth_toward(
                 data->velocity_vertical_fp,
                 target_vertical_fp,
-                config->velocity_smoothing
+                NURUNURU_VELOCITY_SMOOTHING
             );
     } else {
         /*
@@ -458,7 +494,7 @@ static void scroll_nurunuru_work_callback(
          */
         bool waiting_for_release =
             data->input_was_active &&
-            idle_ms < config->release_ms;
+            idle_ms < NURUNURU_RELEASE_MS;
 
         if (!waiting_for_release) {
             bool input_just_stopped =
@@ -466,7 +502,7 @@ static void scroll_nurunuru_work_callback(
 
             bool fast_enough_for_inertia =
                 data->last_input_speed >=
-                config->inertia_start_speed;
+                inertia_start_speed;
 
             if (
                 input_just_stopped &&
@@ -485,13 +521,13 @@ static void scroll_nurunuru_work_callback(
                 data->velocity_horizontal_fp =
                     apply_friction(
                         data->velocity_horizontal_fp,
-                        config->friction_percent
+                        friction_percent
                     );
 
                 data->velocity_vertical_fp =
                     apply_friction(
                         data->velocity_vertical_fp,
-                        config->friction_percent
+                        friction_percent
                     );
             }
         }
@@ -499,7 +535,7 @@ static void scroll_nurunuru_work_callback(
 
     data->input_was_active =
         input_is_active ||
-        (data->input_was_active && idle_ms < config->release_ms);
+        (data->input_was_active && idle_ms < NURUNURU_RELEASE_MS);
 
     data->output_horizontal_fp +=
         data->velocity_horizontal_fp;
@@ -530,7 +566,7 @@ static void scroll_nurunuru_work_callback(
     data->velocity_vertical_fp != 0;
 
     bool inertia_is_allowed =
-        idle_ms < config->inertia_timeout_ms;
+        idle_ms < inertia_timeout_ms;
 
     bool continue_running =
         input_is_active ||
@@ -539,7 +575,7 @@ static void scroll_nurunuru_work_callback(
     if (continue_running) {
         k_work_reschedule(
             &data->work,
-            K_MSEC(config->report_interval_ms)
+            K_MSEC(NURUNURU_REPORT_INTERVAL_MS)
         );
     } else {
         data->worker_running = false;
@@ -659,7 +695,7 @@ static int scroll_nurunuru_handle_event(
 
         k_work_reschedule(
             &data->work,
-            K_MSEC(config->report_interval_ms)
+            K_MSEC(NURUNURU_REPORT_INTERVAL_MS)
         );
     }
 
@@ -730,82 +766,17 @@ static const struct zmk_input_processor_driver_api
                                                                        \
     static const struct scroll_nurunuru_config                         \
         scroll_nurunuru_config_##inst = {                             \
-            .report_interval_ms =                                     \
-                DT_INST_PROP_OR(                                      \
-                    inst,                                             \
-                    report_interval_ms,                               \
-                    8                                                 \
-                ),                                                    \
+            .scroll_scale =                                           \
+                DT_INST_PROP_OR(inst, scroll_scale, 7),               \
                                                                        \
-            .release_ms =                                             \
-                DT_INST_PROP_OR(                                      \
-                    inst,                                             \
-                    release_ms,                                       \
-                    24                                                \
-                ),                                                    \
+            .acceleration =                                           \
+                DT_INST_PROP_OR(inst, acceleration, 10),              \
                                                                        \
-            .horizontal_divisor =                                     \
-                DT_INST_PROP_OR(                                      \
-                    inst,                                             \
-                    horizontal_divisor,                               \
-                    15                                                \
-                ),                                                    \
+            .inertia =                                                \
+                DT_INST_PROP_OR(inst, inertia, 8),                    \
                                                                        \
-            .vertical_divisor =                                       \
-                DT_INST_PROP_OR(                                      \
-                    inst,                                             \
-                    vertical_divisor,                                 \
-                    15                                                \
-                ),                                                    \
-                                                                       \
-            .velocity_smoothing =                                     \
-                DT_INST_PROP_OR(                                      \
-                    inst,                                             \
-                    velocity_smoothing,                               \
-                    40                                                \
-                ),                                                    \
-                                                                       \
-            .acceleration_start =                                     \
-                DT_INST_PROP_OR(                                      \
-                    inst,                                             \
-                    acceleration_start,                               \
-                    2                                                 \
-                ),                                                    \
-                                                                       \
-            .acceleration_end =                                       \
-                DT_INST_PROP_OR(                                      \
-                    inst,                                             \
-                    acceleration_end,                                 \
-                    12                                                \
-                ),                                                    \
-                                                                       \
-            .max_gain_percent =                                       \
-                DT_INST_PROP_OR(                                       \
-                    inst,                                              \
-                    max_gain_percent,                                  \
-                    300                                                \
-                ),                                                     \
-                                                                       \
-            .friction_percent =                                        \
-                DT_INST_PROP_OR(                                        \
-                    inst,                                               \
-                    friction_percent,                                   \
-                    86                                                  \
-                ),                                                      \
-                                                                        \
-            .inertia_start_speed =                                      \
-                DT_INST_PROP_OR(                                        \
-                    inst,                                               \
-                    inertia_start_speed,                                \
-                    6                                                   \
-                ),                                                      \
-                                                                        \
-            .inertia_timeout_ms =                                       \
-                DT_INST_PROP_OR(                                        \
-                    inst,                                               \
-                    inertia_timeout_ms,                                 \
-                    300                                                 \
-                ),                                                      \
+            .brake =                                                  \
+                DT_INST_PROP_OR(inst, brake, 3),                      \
                                                                        \
             .invert_horizontal =                                      \
                 DT_INST_PROP_OR(                                      \
