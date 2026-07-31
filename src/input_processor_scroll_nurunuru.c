@@ -30,11 +30,11 @@ LOG_MODULE_REGISTER(
 #define NURUNURU_HOVER_STRENGTH_MULTIPLIER 3
 
 /*
- * About 96 ms at an 8 ms report interval.
+ * About 160 ms at an 8 ms report interval.
  */
-#define NURUNURU_ROLLING_FULL_CHARGE_FRAMES 12
-#define NURUNURU_ROLLING_RESPONSE 18
-#define NURUNURU_REVERSE_STOP_MS 200
+#define NURUNURU_ROLLING_FULL_CHARGE_FRAMES 20
+#define NURUNURU_ROLLING_RESPONSE 24
+#define NURUNURU_REVERSE_STOP_MS 150
 
 struct scroll_nurunuru_config {
     uint8_t scroll_scale;
@@ -143,16 +143,41 @@ static uint16_t get_max_gain_percent(
     return (uint16_t)clamp_tuning(config->acceleration) * 100U;
 }
 
+/*
+ * Public inertia is intentionally front-loaded:
+ *
+ * public 1 -> internal 2
+ * public 2 -> internal 4
+ * public 3 -> internal 6
+ * public 4 -> internal 8
+ * public 5..10 -> internal 10
+ *
+ * Therefore inertia = 5 gives approximately the previous inertia = 10
+ * behavior, leaving the upper half of the public range as "maximum glide".
+ */
+static uint8_t get_effective_inertia(
+    const struct scroll_nurunuru_config *config
+) {
+    return (uint8_t)MIN(
+        clamp_tuning(config->inertia) * 2,
+        10
+    );
+}
+
 static uint16_t get_inertia_start_speed(
     const struct scroll_nurunuru_config *config
 ) {
-    return (uint16_t)(11 - clamp_tuning(config->inertia));
+    return (uint16_t)(
+        11 - get_effective_inertia(config)
+    );
 }
 
 static uint16_t get_inertia_timeout_ms(
     const struct scroll_nurunuru_config *config
 ) {
-    return (uint16_t)(500 + clamp_tuning(config->inertia) * 500);
+    return (uint16_t)(
+        500 + get_effective_inertia(config) * 500
+    );
 }
 
 static int32_t smooth_toward(
@@ -371,19 +396,33 @@ static int32_t calculate_rolling_target_fp(
         smoothstep_scaled(speed_progress);
 
     /*
-     * inertia 1  -> maximum rolling momentum about 0.25x raw input
-     * inertia 7  -> maximum rolling momentum about 1.75x raw input
-     * inertia 10 -> maximum rolling momentum about 2.50x raw input
+     * Use a convex charge curve so momentum builds increasingly strongly:
+     *
+     * early rolling  -> gentle
+     * middle rolling -> clearly accelerating
+     * late rolling   -> dramatic "ドドドド" build-up
+     */
+    int32_t charge_squared =
+        (int32_t)(
+            ((int64_t)charge * charge) /
+            NURUNURU_GAIN_SCALE
+        );
+
+    /*
+     * effective inertia 2  -> maximum about 0.8x raw input
+     * effective inertia 8  -> maximum about 3.2x raw input
+     * effective inertia 10 -> maximum about 4.0x raw input
      */
     int32_t strength_scaled =
         ((int32_t)clamp_tuning(inertia) *
-         NURUNURU_GAIN_SCALE) /
-        4;
+         NURUNURU_GAIN_SCALE *
+         2) /
+        5;
 
     int64_t target =
         (int64_t)raw_input_fp *
         strength_scaled *
-        charge *
+        charge_squared *
         low_speed_factor;
 
     target /=
@@ -425,7 +464,7 @@ static uint8_t calculate_retention_percent(
     int32_t vertical_velocity_fp,
     const struct scroll_nurunuru_config *config
 ) {
-    uint8_t inertia = clamp_tuning(config->inertia);
+    uint8_t inertia = get_effective_inertia(config);
     uint8_t brake = clamp_tuning(config->brake);
 
     uint8_t fast_retention =
@@ -817,7 +856,7 @@ static void scroll_nurunuru_work_callback(
                 raw_horizontal_fp,
                 data->rolling_frames,
                 speed,
-                config->inertia
+                get_effective_inertia(config)
             );
 
         int32_t rolling_vertical_target_fp =
@@ -825,7 +864,7 @@ static void scroll_nurunuru_work_callback(
                 raw_vertical_fp,
                 data->rolling_frames,
                 speed,
-                config->inertia
+                get_effective_inertia(config)
             );
 
         data->rolling_horizontal_fp =
