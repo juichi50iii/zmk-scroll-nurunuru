@@ -52,6 +52,9 @@ struct scroll_nurunuru_config {
     uint16_t acceleration_end;
     uint16_t max_gain_percent;
 
+    uint8_t friction_percent;
+    uint16_t inertia_timeout_ms;
+
     bool invert_horizontal;
     bool invert_vertical;
 };
