@@ -592,7 +592,27 @@ static int scroll_nurunuru_handle_event(
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
-    if (event->value == 0) {
+    uint16_t original_code =
+        event->code;
+
+    int32_t original_value =
+        event->value;
+
+    /*
+     * Zephyr passes the same mutable input_event to every listener.
+     *
+     * ZMK_INPUT_PROC_STOP only stops this listener's processor chain.
+     * Convert the original X/Y event into a zero-valued wheel event so
+     * another listener cannot interpret it as cursor movement.
+     */
+    event->code =
+        original_code == INPUT_REL_X
+            ? INPUT_REL_WHEEL
+            : INPUT_REL_HWHEEL;
+
+    event->value = 0;
+
+    if (original_value == 0) {
         return ZMK_INPUT_PROC_STOP;
     }
 
@@ -610,12 +630,12 @@ static int scroll_nurunuru_handle_event(
      * Physical X movement becomes vertical scrolling.
      * Physical Y movement becomes horizontal scrolling.
      */
-    if (event->code == INPUT_REL_X) {
+    if (original_code == INPUT_REL_X) {
         data->pending_vertical +=
-            event->value;
+            original_value;
     } else {
         data->pending_horizontal +=
-            event->value;
+            original_value;
     }
 
     data->last_input_ms =
@@ -632,8 +652,8 @@ static int scroll_nurunuru_handle_event(
 
     LOG_DBG(
         "input code=%u value=%d pending=(%ld,%ld)",
-        event->code,
-        event->value,
+        original_code,
+        original_value,
         (long)data->pending_horizontal,
         (long)data->pending_vertical
     );
