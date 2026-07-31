@@ -33,6 +33,8 @@ LOG_MODULE_REGISTER(
  * About 96 ms at an 8 ms report interval.
  */
 #define NURUNURU_ROLLING_FULL_CHARGE_FRAMES 12
+#define NURUNURU_ROLLING_RESPONSE 18
+#define NURUNURU_REVERSE_STOP_MS 200
 
 struct scroll_nurunuru_config {
     uint8_t scroll_scale;
@@ -61,11 +63,21 @@ struct scroll_nurunuru_data {
     bool hover_active;
 
     /*
-     * Continuous same-direction rolling builds additional momentum.
+     * Continuous same-direction rolling builds momentum gradually.
+     * The momentum is blended into velocity while input is active.
      */
     uint8_t rolling_frames;
     int8_t rolling_horizontal_direction;
     int8_t rolling_vertical_direction;
+    int32_t rolling_horizontal_fp;
+    int32_t rolling_vertical_fp;
+
+    /*
+     * Reverse input immediately stops the corresponding axis and suppresses
+     * new output for a short period.
+     */
+    uint32_t horizontal_stop_until_ms;
+    uint32_t vertical_stop_until_ms;
 
     int32_t output_horizontal_fp;
     int32_t output_vertical_fp;
@@ -323,7 +335,8 @@ static int32_t calculate_hover_force_fp(
  * inertia 7  -> up to about 1.7x
  * inertia 10 -> up to about 2.0x
  */
-static int32_t calculate_rolling_gain_scaled(
+static int32_t calculate_rolling_target_fp(
+    int32_t raw_input_fp,
     uint8_t rolling_frames,
     int32_t speed,
     uint8_t inertia
@@ -343,6 +356,10 @@ static int32_t calculate_rolling_gain_scaled(
     int32_t charge =
         smoothstep_scaled(progress);
 
+    /*
+     * Rolling momentum is strongest at low speed and fades toward speed 10,
+     * where ordinary acceleration already dominates.
+     */
     int32_t speed_position =
         CLAMP(speed - 1, 0, 9);
 
@@ -353,24 +370,49 @@ static int32_t calculate_rolling_gain_scaled(
         NURUNURU_GAIN_SCALE -
         smoothstep_scaled(speed_progress);
 
-    int32_t extra_gain =
+    /*
+     * inertia 1  -> maximum rolling momentum about 0.25x raw input
+     * inertia 7  -> maximum rolling momentum about 1.75x raw input
+     * inertia 10 -> maximum rolling momentum about 2.50x raw input
+     */
+    int32_t strength_scaled =
         ((int32_t)clamp_tuning(inertia) *
          NURUNURU_GAIN_SCALE) /
-        10;
+        4;
 
-    int64_t added_gain =
-        (int64_t)extra_gain *
+    int64_t target =
+        (int64_t)raw_input_fp *
+        strength_scaled *
         charge *
         low_speed_factor;
 
-    added_gain /=
+    target /=
         (int64_t)NURUNURU_GAIN_SCALE *
+        NURUNURU_GAIN_SCALE *
         NURUNURU_GAIN_SCALE;
 
-    return NURUNURU_GAIN_SCALE +
-           (int32_t)added_gain;
+    return (int32_t)CLAMP(
+        target,
+        (int64_t)INT32_MIN,
+        (int64_t)INT32_MAX
+    );
 }
 
+static bool timestamp_is_future(
+    uint32_t until_ms,
+    uint32_t now_ms
+) {
+    return (int32_t)(until_ms - now_ms) > 0;
+}
+
+static bool directions_are_opposite(
+    int32_t input_value,
+    int32_t velocity_fp
+) {
+    return input_value != 0 &&
+           velocity_fp != 0 &&
+           sign_i32(input_value) != sign_i32(velocity_fp);
+}
 
 /*
  * Velocity-dependent retention.
@@ -551,24 +593,97 @@ static void scroll_nurunuru_work_callback(
     uint32_t now_ms = k_uptime_get_32();
     uint32_t idle_ms = now_ms - data->last_input_ms;
 
+    bool horizontal_stopped =
+        timestamp_is_future(
+            data->horizontal_stop_until_ms,
+            now_ms
+        );
+
+    bool vertical_stopped =
+        timestamp_is_future(
+            data->vertical_stop_until_ms,
+            now_ms
+        );
+
+    /*
+     * Any opposite-direction input immediately kills motion on that axis.
+     * The triggering input is consumed and the axis remains stopped for
+     * NURUNURU_REVERSE_STOP_MS.
+     */
+    if (
+        !horizontal_stopped &&
+        directions_are_opposite(
+            frame_horizontal,
+            data->velocity_horizontal_fp
+        )
+    ) {
+        data->velocity_horizontal_fp = 0;
+        data->rolling_horizontal_fp = 0;
+        data->output_horizontal_fp = 0;
+        data->hover_horizontal_fp = 0;
+        data->rolling_horizontal_direction = 0;
+
+        data->horizontal_stop_until_ms =
+            now_ms + NURUNURU_REVERSE_STOP_MS;
+
+        frame_horizontal = 0;
+        horizontal_stopped = true;
+    }
+
+    if (
+        !vertical_stopped &&
+        directions_are_opposite(
+            frame_vertical,
+            data->velocity_vertical_fp
+        )
+    ) {
+        data->velocity_vertical_fp = 0;
+        data->rolling_vertical_fp = 0;
+        data->output_vertical_fp = 0;
+        data->hover_vertical_fp = 0;
+        data->rolling_vertical_direction = 0;
+
+        data->vertical_stop_until_ms =
+            now_ms + NURUNURU_REVERSE_STOP_MS;
+
+        frame_vertical = 0;
+        vertical_stopped = true;
+    }
+
+    if (horizontal_stopped) {
+        frame_horizontal = 0;
+        data->velocity_horizontal_fp = 0;
+        data->rolling_horizontal_fp = 0;
+        data->output_horizontal_fp = 0;
+        data->hover_horizontal_fp = 0;
+    }
+
+    if (vertical_stopped) {
+        frame_vertical = 0;
+        data->velocity_vertical_fp = 0;
+        data->rolling_vertical_fp = 0;
+        data->output_vertical_fp = 0;
+        data->hover_vertical_fp = 0;
+    }
+
     bool input_is_active =
         frame_horizontal != 0 ||
         frame_vertical != 0;
 
     bool input_just_started =
-        input_is_active && !data->input_was_active;
+        input_is_active &&
+        !data->input_was_active;
 
-    int32_t speed = 0;
+    int32_t speed =
+        max_i32(
+            abs_i32(frame_horizontal),
+            abs_i32(frame_vertical)
+        );
+
     int32_t gain_scaled = NURUNURU_GAIN_SCALE;
     uint8_t retention_percent = 0;
 
     if (input_is_active) {
-        speed =
-            max_i32(
-                abs_i32(frame_horizontal),
-                abs_i32(frame_vertical)
-            );
-
         data->last_input_speed = speed;
 
         int8_t horizontal_direction =
@@ -595,6 +710,14 @@ static void scroll_nurunuru_work_callback(
             vertical_reversed
         ) {
             data->rolling_frames = 0;
+
+            if (horizontal_reversed) {
+                data->rolling_horizontal_fp = 0;
+            }
+
+            if (vertical_reversed) {
+                data->rolling_vertical_fp = 0;
+            }
         } else if (data->rolling_frames < UINT8_MAX) {
             data->rolling_frames++;
         }
@@ -636,13 +759,19 @@ static void scroll_nurunuru_work_callback(
 
         int32_t target_horizontal_fp =
             raw_to_velocity_fp(
-                apply_gain(frame_horizontal, gain_scaled),
+                apply_gain(
+                    frame_horizontal,
+                    gain_scaled
+                ),
                 scroll_divisor
             );
 
         int32_t target_vertical_fp =
             raw_to_velocity_fp(
-                apply_gain(frame_vertical, gain_scaled),
+                apply_gain(
+                    frame_vertical,
+                    gain_scaled
+                ),
                 scroll_divisor
             );
 
@@ -673,32 +802,57 @@ static void scroll_nurunuru_work_callback(
             }
         }
 
-        /*
-         * Current velocity carries the inertia from previous frames.
-         * Input acceleration and hover overlap in the effective target.
-         */
-        target_horizontal_fp += hover_horizontal_force_fp;
-        target_vertical_fp += hover_vertical_force_fp;
+        target_horizontal_fp +=
+            hover_horizontal_force_fp;
 
-        int32_t rolling_gain_scaled =
-            calculate_rolling_gain_scaled(
+        target_vertical_fp +=
+            hover_vertical_force_fp;
+
+        /*
+         * Rolling no longer multiplies target velocity abruptly.
+         * Instead, it approaches a separate momentum target slowly.
+         */
+        int32_t rolling_horizontal_target_fp =
+            calculate_rolling_target_fp(
+                raw_horizontal_fp,
                 data->rolling_frames,
                 speed,
                 config->inertia
             );
 
-        target_horizontal_fp =
-            apply_gain(
-                target_horizontal_fp,
-                rolling_gain_scaled
+        int32_t rolling_vertical_target_fp =
+            calculate_rolling_target_fp(
+                raw_vertical_fp,
+                data->rolling_frames,
+                speed,
+                config->inertia
             );
 
-        target_vertical_fp =
-            apply_gain(
-                target_vertical_fp,
-                rolling_gain_scaled
+        data->rolling_horizontal_fp =
+            smooth_toward(
+                data->rolling_horizontal_fp,
+                rolling_horizontal_target_fp,
+                NURUNURU_ROLLING_RESPONSE
             );
 
+        data->rolling_vertical_fp =
+            smooth_toward(
+                data->rolling_vertical_fp,
+                rolling_vertical_target_fp,
+                NURUNURU_ROLLING_RESPONSE
+            );
+
+        target_horizontal_fp +=
+            data->rolling_horizontal_fp;
+
+        target_vertical_fp +=
+            data->rolling_vertical_fp;
+
+        /*
+         * Current velocity follows the combined input, hover and rolling
+         * momentum. Once input ends, this velocity is handed directly to the
+         * inertia path below.
+         */
         data->velocity_horizontal_fp =
             smooth_toward(
                 data->velocity_horizontal_fp,
@@ -717,10 +871,6 @@ static void scroll_nurunuru_work_callback(
             data->input_was_active &&
             idle_ms < NURUNURU_RELEASE_MS;
 
-        /*
-         * Never hold velocity perfectly still during the release window.
-         * A light, velocity-dependent retention prevents low-speed hovering.
-         */
         retention_percent =
             calculate_retention_percent(
                 data->velocity_horizontal_fp,
@@ -728,15 +878,26 @@ static void scroll_nurunuru_work_callback(
                 config
             );
 
+        /*
+         * The release window stays highly slippery so accumulated rolling
+         * momentum flows naturally into inertia instead of falling off.
+         */
         if (waiting_for_release) {
             retention_percent =
-                (uint8_t)MIN(retention_percent + 1, 99);
+                (uint8_t)MIN(
+                    retention_percent + 2,
+                    99
+                );
         }
 
         bool fast_enough_for_inertia =
-            data->last_input_speed >= inertia_start_speed;
+            data->last_input_speed >=
+            inertia_start_speed;
 
-        if (!waiting_for_release && !fast_enough_for_inertia) {
+        if (
+            !waiting_for_release &&
+            !fast_enough_for_inertia
+        ) {
             data->velocity_horizontal_fp = 0;
             data->velocity_vertical_fp = 0;
         } else {
@@ -753,12 +914,14 @@ static void scroll_nurunuru_work_callback(
                 );
         }
 
+        /*
+         * Rolling momentum has already been blended into velocity.
+         * Clear the separate target state without affecting the glide.
+         */
+        data->rolling_horizontal_fp = 0;
+        data->rolling_vertical_fp = 0;
         data->hover_active = false;
 
-        /*
-         * Keep rolling charge across short sensor gaps. Reset it only after
-         * the release window has fully elapsed.
-         */
         if (idle_ms >= NURUNURU_RELEASE_MS) {
             data->rolling_frames = 0;
             data->rolling_horizontal_direction = 0;
@@ -768,7 +931,10 @@ static void scroll_nurunuru_work_callback(
 
     data->input_was_active =
         input_is_active ||
-        (data->input_was_active && idle_ms < NURUNURU_RELEASE_MS);
+        (
+            data->input_was_active &&
+            idle_ms < NURUNURU_RELEASE_MS
+        );
 
     data->output_horizontal_fp +=
         data->velocity_horizontal_fp;
@@ -786,6 +952,16 @@ static void scroll_nurunuru_work_callback(
             &data->output_vertical_fp
         );
 
+    if (horizontal_stopped) {
+        output_horizontal = 0;
+        data->output_horizontal_fp = 0;
+    }
+
+    if (vertical_stopped) {
+        output_vertical = 0;
+        data->output_vertical_fp = 0;
+    }
+
     if (config->invert_horizontal) {
         output_horizontal = -output_horizontal;
     }
@@ -798,11 +974,16 @@ static void scroll_nurunuru_work_callback(
         data->velocity_horizontal_fp != 0 ||
         data->velocity_vertical_fp != 0;
 
+    bool stop_window_is_active =
+        horizontal_stopped ||
+        vertical_stopped;
+
     bool inertia_is_allowed =
         idle_ms < inertia_timeout_ms;
 
     bool continue_running =
         input_is_active ||
+        stop_window_is_active ||
         (velocity_is_active && inertia_is_allowed);
 
     if (continue_running) {
@@ -812,8 +993,13 @@ static void scroll_nurunuru_work_callback(
         );
     } else {
         data->worker_running = false;
+
         data->velocity_horizontal_fp = 0;
         data->velocity_vertical_fp = 0;
+
+        data->rolling_horizontal_fp = 0;
+        data->rolling_vertical_fp = 0;
+
         data->hover_active = false;
         data->rolling_frames = 0;
         data->rolling_horizontal_direction = 0;
@@ -823,14 +1009,17 @@ static void scroll_nurunuru_work_callback(
     input_device = data->input_device;
 
     LOG_DBG(
-        "frame=(%ld,%ld) speed=%ld gain=%ld retention=%u hover=%u rolling=%u velocity=(%ld,%ld) output=(%d,%d) idle=%u",
+        "frame=(%ld,%ld) speed=%ld gain=%ld retention=%u hover=%u rolling=(%ld,%ld) stop=(%u,%u) velocity=(%ld,%ld) output=(%d,%d) idle=%u",
         (long)frame_horizontal,
         (long)frame_vertical,
         (long)speed,
         (long)gain_scaled,
         retention_percent,
         data->hover_frame,
-        data->rolling_frames,
+        (long)data->rolling_horizontal_fp,
+        (long)data->rolling_vertical_fp,
+        horizontal_stopped,
+        vertical_stopped,
         (long)data->velocity_horizontal_fp,
         (long)data->velocity_vertical_fp,
         output_horizontal,
@@ -934,6 +1123,11 @@ static int scroll_nurunuru_init(
     data->rolling_frames = 0;
     data->rolling_horizontal_direction = 0;
     data->rolling_vertical_direction = 0;
+    data->rolling_horizontal_fp = 0;
+    data->rolling_vertical_fp = 0;
+
+    data->horizontal_stop_until_ms = 0;
+    data->vertical_stop_until_ms = 0;
 
     data->output_horizontal_fp = 0;
     data->output_vertical_fp = 0;
