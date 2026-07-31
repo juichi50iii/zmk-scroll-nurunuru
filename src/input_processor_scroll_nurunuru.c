@@ -55,20 +55,22 @@ LOG_MODULE_REGISTER(
  * Acceleration is allowed to follow relatively quickly.
  * Deceleration and temporary sensor gaps are deliberately much slower.
  */
-#define NURUNURU_ROLLING_ACCEL_RESPONSE 18
-#define NURUNURU_ROLLING_DECEL_RESPONSE 4
+#define NURUNURU_ROLLING_ACCEL_RESPONSE 5
+#define NURUNURU_ROLLING_DECEL_RESPONSE 2
 
 /*
  * Minimum virtual cruise velocity while ROLLING input is active.
  * This prevents low-speed sensor chatter from becoming visible stop/start.
  */
-#define NURUNURU_ROLLING_MIN_CRUISE_FP 96
+#define NURUNURU_ROLLING_MIN_CRUISE_FP 144
 
 /*
  * After ROLLING input ends, preserve the last cruise velocity briefly before
  * normal inertia takes over.
  */
-#define NURUNURU_ROLLING_COAST_BRIDGE_MS 120
+#define NURUNURU_ROLLING_BRIDGE_MIN_MS 160
+#define NURUNURU_ROLLING_BRIDGE_MAX_MS 1000
+#define NURUNURU_ROLLING_BRIDGE_FULL_SPEED_FP     (4 * NURUNURU_FP_SCALE)
 #define NURUNURU_ROLLING_BRIDGE_RETENTION_PER_MILLE 995
 
 #define NURUNURU_FIXED_SCROLL_DIVISOR 24
@@ -141,6 +143,7 @@ struct scroll_nurunuru_data {
      */
     bool rolling_bridge_active;
     uint32_t rolling_bridge_started_ms;
+    uint16_t rolling_bridge_duration_ms;
     int32_t rolling_bridge_horizontal_fp;
     int32_t rolling_bridge_vertical_fp;
 
@@ -331,6 +334,54 @@ static int32_t enforce_minimum_cruise(
 
     return (int32_t)direction *
            minimum_cruise_fp;
+}
+
+static uint16_t calculate_rolling_bridge_duration_ms(
+    int32_t horizontal_velocity_fp,
+    int32_t vertical_velocity_fp
+) {
+    int32_t speed_fp =
+        max_i32(
+            abs_i32(horizontal_velocity_fp),
+            abs_i32(vertical_velocity_fp)
+        );
+
+    speed_fp =
+        CLAMP(
+            speed_fp,
+            0,
+            NURUNURU_ROLLING_BRIDGE_FULL_SPEED_FP
+        );
+
+    int32_t progress =
+        (int32_t)(
+            ((int64_t)speed_fp *
+             NURUNURU_GAIN_SCALE) /
+            NURUNURU_ROLLING_BRIDGE_FULL_SPEED_FP
+        );
+
+    /*
+     * Smoothstep makes low-speed bridges stay modest while faster rolling
+     * gestures earn a rapidly longer glide, up to one second.
+     */
+    int32_t curve =
+        smoothstep_scaled(progress);
+
+    uint32_t duration =
+        NURUNURU_ROLLING_BRIDGE_MIN_MS +
+        (uint32_t)(
+            ((int64_t)(
+                NURUNURU_ROLLING_BRIDGE_MAX_MS -
+                NURUNURU_ROLLING_BRIDGE_MIN_MS
+            ) * curve) /
+            NURUNURU_GAIN_SCALE
+        );
+
+    return (uint16_t)CLAMP(
+        duration,
+        NURUNURU_ROLLING_BRIDGE_MIN_MS,
+        NURUNURU_ROLLING_BRIDGE_MAX_MS
+    );
 }
 
 static int32_t apply_retention_per_mille(
@@ -1293,6 +1344,12 @@ static void scroll_nurunuru_work_callback(
         ) {
             data->rolling_bridge_active = true;
             data->rolling_bridge_started_ms = now_ms;
+            data->rolling_bridge_duration_ms =
+                calculate_rolling_bridge_duration_ms(
+                    data->velocity_horizontal_fp,
+                    data->velocity_vertical_fp
+                );
+
             data->rolling_bridge_horizontal_fp =
                 data->velocity_horizontal_fp;
             data->rolling_bridge_vertical_fp =
@@ -1304,7 +1361,7 @@ static void scroll_nurunuru_work_callback(
             (
                 now_ms -
                 data->rolling_bridge_started_ms
-            ) < NURUNURU_ROLLING_COAST_BRIDGE_MS;
+            ) < data->rolling_bridge_duration_ms;
 
         if (rolling_bridge_running) {
             data->rolling_bridge_horizontal_fp =
@@ -1484,6 +1541,7 @@ static void scroll_nurunuru_work_callback(
         data->rolling_vertical_fp = 0;
 
         data->rolling_bridge_active = false;
+        data->rolling_bridge_duration_ms = 0;
         data->rolling_bridge_horizontal_fp = 0;
         data->rolling_bridge_vertical_fp = 0;
 
@@ -1502,7 +1560,7 @@ static void scroll_nurunuru_work_callback(
     input_device = data->input_device;
 
     LOG_DBG(
-        "frame=(%ld,%ld) speed=%ld mode=%u gain=%ld retention=%u hover=%u rolling=(%ld,%ld) stop=(%u,%u) velocity=(%ld,%ld) output=(%d,%d) idle=%u",
+        "frame=(%ld,%ld) speed=%ld mode=%u gain=%ld retention=%u hover=%u rolling=(%ld,%ld) bridge=%u stop=(%u,%u) velocity=(%ld,%ld) output=(%d,%d) idle=%u",
         (long)frame_horizontal,
         (long)frame_vertical,
         (long)speed,
@@ -1512,6 +1570,7 @@ static void scroll_nurunuru_work_callback(
         data->hover_frame,
         (long)data->rolling_horizontal_fp,
         (long)data->rolling_vertical_fp,
+        data->rolling_bridge_duration_ms,
         horizontal_stopped,
         vertical_stopped,
         (long)data->velocity_horizontal_fp,
@@ -1631,6 +1690,7 @@ static int scroll_nurunuru_init(
 
     data->rolling_bridge_active = false;
     data->rolling_bridge_started_ms = 0;
+    data->rolling_bridge_duration_ms = 0;
     data->rolling_bridge_horizontal_fp = 0;
     data->rolling_bridge_vertical_fp = 0;
 
