@@ -33,6 +33,7 @@ LOG_MODULE_REGISTER(
 
 struct scroll_nurunuru_config {
     uint16_t report_interval_ms;
+    uint16_t release_ms;
 
     int16_t horizontal_divisor;
     int16_t vertical_divisor;
@@ -448,45 +449,57 @@ static void scroll_nurunuru_work_callback(
                 config->velocity_smoothing
             );
     } else {
-    /*
-     * Decide whether inertia should begin on the first frame after
-     * physical movement stops.
-     */
-        bool input_just_stopped =
-            data->input_was_active;
+        /*
+         * Sensor reports can have gaps longer than the worker interval.
+         * Do not interpret a single empty worker frame as release.
+         *
+         * During this grace period, retain the most recent velocity so
+         * sparse low-speed sensor events are interpolated smoothly.
+         */
+        bool waiting_for_release =
+            data->input_was_active &&
+            idle_ms < config->release_ms;
 
-        bool fast_enough_for_inertia =
-            data->last_input_speed >=
-            config->inertia_start_speed;
+        if (!waiting_for_release) {
+            bool input_just_stopped =
+                data->input_was_active;
 
-        if (
-            input_just_stopped &&
-            !fast_enough_for_inertia
-        ) {
-            /*
-            * Slow, deliberate movement should stop immediately.
-            */
-            data->velocity_horizontal_fp = 0;
-            data->velocity_vertical_fp = 0;
-        } else {
-            /*
-            * A sufficiently fast gesture continues with friction.
-            */
-            data->velocity_horizontal_fp =
-                apply_friction(
-                    data->velocity_horizontal_fp,
-                    config->friction_percent
-                );
+            bool fast_enough_for_inertia =
+                data->last_input_speed >=
+                config->inertia_start_speed;
 
-            data->velocity_vertical_fp =
-                apply_friction(
-                    data->velocity_vertical_fp,
-                    config->friction_percent
-                );
+            if (
+                input_just_stopped &&
+                !fast_enough_for_inertia
+            ) {
+                /*
+                 * Slow, deliberate movement stops only after the release
+                 * grace period has elapsed.
+                 */
+                data->velocity_horizontal_fp = 0;
+                data->velocity_vertical_fp = 0;
+            } else {
+                /*
+                 * A sufficiently fast gesture continues with friction.
+                 */
+                data->velocity_horizontal_fp =
+                    apply_friction(
+                        data->velocity_horizontal_fp,
+                        config->friction_percent
+                    );
+
+                data->velocity_vertical_fp =
+                    apply_friction(
+                        data->velocity_vertical_fp,
+                        config->friction_percent
+                    );
+            }
         }
     }
+
     data->input_was_active =
-        input_is_active;
+        input_is_active ||
+        (data->input_was_active && idle_ms < config->release_ms);
 
     data->output_horizontal_fp +=
         data->velocity_horizontal_fp;
@@ -722,6 +735,13 @@ static const struct zmk_input_processor_driver_api
                     inst,                                             \
                     report_interval_ms,                               \
                     8                                                 \
+                ),                                                    \
+                                                                       \
+            .release_ms =                                             \
+                DT_INST_PROP_OR(                                      \
+                    inst,                                             \
+                    release_ms,                                       \
+                    24                                                \
                 ),                                                    \
                                                                        \
             .horizontal_divisor =                                     \

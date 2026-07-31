@@ -27,6 +27,14 @@ properties:
     description: >
       Interval in milliseconds between generated scroll reports.
 
+  release-ms:
+  type: int
+  default: 24
+  description: >
+    Time in milliseconds without sensor movement before the input is
+    considered released. Empty worker frames inside this interval retain
+    the current velocity.
+
   horizontal-divisor:
     type: int
     default: 15
