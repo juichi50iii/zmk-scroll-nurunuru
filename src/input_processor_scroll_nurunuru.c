@@ -54,7 +54,7 @@ LOG_MODULE_REGISTER(
  * 1 / 3 = one-third distance
  */
 #define NURUNURU_OUTPUT_SCALE_NUMERATOR 1
-#define NURUNURU_OUTPUT_SCALE_DENOMINATOR 2
+#define NURUNURU_OUTPUT_SCALE_DENOMINATOR 3
 
 enum scroll_nurunuru_gesture_mode {
     NURUNURU_GESTURE_UNDECIDED = 0,
