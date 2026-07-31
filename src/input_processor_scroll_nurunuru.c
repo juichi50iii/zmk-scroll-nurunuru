@@ -8,6 +8,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include <zephyr/device.h>
 #include <zephyr/input/input.h>
@@ -26,11 +27,18 @@ LOG_MODULE_REGISTER(
 );
 
 /*
- * Internal fixed-point precision.
+ * Internal fixed-point scale.
  *
  * 1 scroll unit = 1024 internal units.
  */
 #define NURUNURU_FP_SCALE 1024
+
+/*
+ * Gain calculation precision.
+ *
+ * 1000 = 1.000
+ */
+#define NURUNURU_GAIN_SCALE 1000
 
 struct scroll_nurunuru_config {
     uint16_t report_interval_ms;
@@ -39,6 +47,10 @@ struct scroll_nurunuru_config {
     int16_t vertical_divisor;
 
     uint8_t velocity_smoothing;
+
+    uint16_t acceleration_start;
+    uint16_t acceleration_end;
+    uint16_t max_gain_percent;
 
     uint16_t idle_timeout_ms;
 
@@ -50,9 +62,9 @@ struct scroll_nurunuru_data {
     const struct device *dev;
 
     /*
-     * Raw movement received since the previous frame.
+     * Raw movement received during the current frame.
      *
-     * The sensor axes are swapped intentionally:
+     * Sensor axes are swapped:
      *
      * INPUT_REL_X -> vertical scroll
      * INPUT_REL_Y -> horizontal scroll
@@ -67,7 +79,7 @@ struct scroll_nurunuru_data {
     int32_t velocity_vertical_fp;
 
     /*
-     * Fractional scroll output retained between HID reports.
+     * Fractional output retained between HID reports.
      */
     int32_t output_horizontal_fp;
     int32_t output_vertical_fp;
@@ -92,14 +104,26 @@ static uint8_t clamp_percentage(uint8_t value) {
     return CLAMP(value, 1, 100);
 }
 
+static int32_t abs_i32(int32_t value) {
+    if (value == INT32_MIN) {
+        return INT32_MAX;
+    }
+
+    return value < 0 ? -value : value;
+}
+
+static int32_t max_i32(int32_t a, int32_t b) {
+    return a > b ? a : b;
+}
+
 /*
- * Move current toward target by a percentage.
+ * Smoothly move current toward target.
  *
  * smoothing = 100:
- *     current immediately becomes target.
+ *     immediate response
  *
  * smoothing = 40:
- *     40% of the difference is applied each frame.
+ *     apply 40 percent of the remaining difference each frame
  */
 static int32_t smooth_toward(
     int32_t current,
@@ -108,8 +132,102 @@ static int32_t smooth_toward(
 ) {
     smoothing = clamp_percentage(smoothing);
 
+    int64_t difference =
+        (int64_t)target - current;
+
     return current +
-           ((target - current) * smoothing) / 100;
+           (int32_t)((difference * smoothing) / 100);
+}
+
+/*
+ * Calculate acceleration gain using smoothstep.
+ *
+ * Below acceleration_start:
+ *     gain = 1.0
+ *
+ * Above acceleration_end:
+ *     gain = maximum
+ *
+ * Between them:
+ *     gain changes continuously using:
+ *
+ *         smoothstep(t) = t² × (3 - 2t)
+ */
+static int32_t calculate_gain_scaled(
+    int32_t speed,
+    uint16_t acceleration_start,
+    uint16_t acceleration_end,
+    uint16_t max_gain_percent
+) {
+    int32_t maximum_gain =
+        ((int32_t)max_gain_percent *
+         NURUNURU_GAIN_SCALE) /
+        100;
+
+    if (maximum_gain < NURUNURU_GAIN_SCALE) {
+        maximum_gain = NURUNURU_GAIN_SCALE;
+    }
+
+    if (acceleration_end <= acceleration_start) {
+        return speed >= acceleration_start
+                   ? maximum_gain
+                   : NURUNURU_GAIN_SCALE;
+    }
+
+    if (speed <= acceleration_start) {
+        return NURUNURU_GAIN_SCALE;
+    }
+
+    if (speed >= acceleration_end) {
+        return maximum_gain;
+    }
+
+    int32_t range =
+        acceleration_end - acceleration_start;
+
+    int32_t position =
+        speed - acceleration_start;
+
+    /*
+     * t uses NURUNURU_GAIN_SCALE precision.
+     */
+    int64_t t =
+        ((int64_t)position *
+         NURUNURU_GAIN_SCALE) /
+        range;
+
+    int64_t t_squared =
+        (t * t) /
+        NURUNURU_GAIN_SCALE;
+
+    int64_t smoothstep =
+        (t_squared *
+         ((3 * NURUNURU_GAIN_SCALE) - (2 * t))) /
+        NURUNURU_GAIN_SCALE;
+
+    int32_t gain_range =
+        maximum_gain - NURUNURU_GAIN_SCALE;
+
+    return NURUNURU_GAIN_SCALE +
+           (int32_t)(
+               (smoothstep * gain_range) /
+               NURUNURU_GAIN_SCALE
+           );
+}
+
+static int32_t apply_gain(
+    int32_t value,
+    int32_t gain_scaled
+) {
+    int64_t result =
+        ((int64_t)value * gain_scaled) /
+        NURUNURU_GAIN_SCALE;
+
+    return (int32_t)CLAMP(
+        result,
+        (int64_t)INT32_MIN,
+        (int64_t)INT32_MAX
+    );
 }
 
 static int32_t raw_to_velocity_fp(
@@ -120,7 +238,16 @@ static int32_t raw_to_velocity_fp(
         divisor = 1;
     }
 
-    return (raw_value * NURUNURU_FP_SCALE) / divisor;
+    int64_t result =
+        ((int64_t)raw_value *
+         NURUNURU_FP_SCALE) /
+        divisor;
+
+    return (int32_t)CLAMP(
+        result,
+        (int64_t)INT32_MIN,
+        (int64_t)INT32_MAX
+    );
 }
 
 /*
@@ -155,8 +282,7 @@ static void send_scroll_report(
     zmk_endpoints_send_mouse_report();
 
     /*
-     * Clear the stored scroll state so it is not included in a later mouse
-     * report.
+     * Clear the scroll state so it does not leak into a later mouse report.
      */
     zmk_hid_mouse_scroll_set(0, 0);
 }
@@ -207,25 +333,55 @@ static void scroll_nurunuru_work_callback(
         frame_horizontal != 0 ||
         frame_vertical != 0;
 
+    int32_t speed = 0;
+    int32_t gain_scaled =
+        NURUNURU_GAIN_SCALE;
+
     if (input_is_active) {
         /*
-         * Convert this frame's raw movement into a target velocity.
+         * Use the stronger axis as the gesture speed.
+         *
+         * This avoids diagonal movement receiving an unexpectedly larger
+         * acceleration merely because both axes are active.
          */
+        speed =
+            max_i32(
+                abs_i32(frame_horizontal),
+                abs_i32(frame_vertical)
+            );
+
+        gain_scaled =
+            calculate_gain_scaled(
+                speed,
+                config->acceleration_start,
+                config->acceleration_end,
+                config->max_gain_percent
+            );
+
+        int32_t accelerated_horizontal =
+            apply_gain(
+                frame_horizontal,
+                gain_scaled
+            );
+
+        int32_t accelerated_vertical =
+            apply_gain(
+                frame_vertical,
+                gain_scaled
+            );
+
         int32_t target_horizontal_fp =
             raw_to_velocity_fp(
-                frame_horizontal,
+                accelerated_horizontal,
                 config->horizontal_divisor
             );
 
         int32_t target_vertical_fp =
             raw_to_velocity_fp(
-                frame_vertical,
+                accelerated_vertical,
                 config->vertical_divisor
             );
 
-        /*
-         * Smoothly follow the newest measured velocity.
-         */
         data->velocity_horizontal_fp =
             smooth_toward(
                 data->velocity_horizontal_fp,
@@ -241,9 +397,7 @@ static void scroll_nurunuru_work_callback(
             );
     } else {
         /*
-         * Phase 2 deliberately has no inertia.
-         *
-         * Once no new physical movement arrives, velocity stops.
+         * Phase 3 still has no inertia.
          */
         data->velocity_horizontal_fp = 0;
         data->velocity_vertical_fp = 0;
@@ -284,18 +438,16 @@ static void scroll_nurunuru_work_callback(
     } else {
         data->worker_running = false;
 
-        /*
-         * Phase 2 has no coasting, so clear the velocity when the gesture
-         * has completely ended.
-         */
         data->velocity_horizontal_fp = 0;
         data->velocity_vertical_fp = 0;
     }
 
     LOG_DBG(
-        "frame=(%ld,%ld) velocity_fp=(%ld,%ld) output=(%d,%d) remainder_fp=(%ld,%ld) idle=%u",
+        "frame=(%ld,%ld) speed=%ld gain=%ld velocity_fp=(%ld,%ld) output=(%d,%d) remainder_fp=(%ld,%ld) idle=%u",
         (long)frame_horizontal,
         (long)frame_vertical,
+        (long)speed,
+        (long)gain_scaled,
         (long)data->velocity_horizontal_fp,
         (long)data->velocity_vertical_fp,
         output_horizontal,
@@ -353,7 +505,7 @@ static int scroll_nurunuru_handle_event(
     );
 
     /*
-     * Swap the sensor axes for scroll use.
+     * Swap sensor axes for scrolling.
      *
      * Physical X movement becomes vertical scrolling.
      * Physical Y movement becomes horizontal scrolling.
@@ -467,6 +619,27 @@ static const struct zmk_input_processor_driver_api
                     inst,                                             \
                     velocity_smoothing,                               \
                     40                                                \
+                ),                                                    \
+                                                                       \
+            .acceleration_start =                                     \
+                DT_INST_PROP_OR(                                      \
+                    inst,                                             \
+                    acceleration_start,                               \
+                    2                                                 \
+                ),                                                    \
+                                                                       \
+            .acceleration_end =                                       \
+                DT_INST_PROP_OR(                                      \
+                    inst,                                             \
+                    acceleration_end,                                 \
+                    12                                                \
+                ),                                                    \
+                                                                       \
+            .max_gain_percent =                                       \
+                DT_INST_PROP_OR(                                      \
+                    inst,                                             \
+                    max_gain_percent,                                 \
+                    300                                               \
                 ),                                                    \
                                                                        \
             .idle_timeout_ms =                                        \

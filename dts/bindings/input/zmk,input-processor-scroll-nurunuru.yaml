@@ -63,3 +63,22 @@ properties:
     type: boolean
     description: >
       Invert vertical scrolling.
+
+  acceleration-start:
+    type: int
+    default: 2
+    description: >
+      Raw movement per frame at which acceleration begins.
+
+  acceleration-end:
+    type: int
+    default: 12
+    description: >
+      Raw movement per frame at which maximum acceleration is reached.
+
+  max-gain-percent:
+    type: int
+    default: 300
+    description: >
+      Maximum scrolling gain in percent.
+      100 means no acceleration and 300 means three times the base speed.
