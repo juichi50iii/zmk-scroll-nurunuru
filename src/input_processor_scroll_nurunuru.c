@@ -40,6 +40,15 @@ LOG_MODULE_REGISTER(
 #define NURUNURU_FLICK_VELOCITY_RESPONSE 70
 #define NURUNURU_REVERSE_STOP_MS 150
 
+/*
+ * Limit frame-to-frame velocity change.
+ *
+ * ROLLING is deliberately softer.
+ * FLICK remains responsive while avoiding sudden jumps.
+ */
+#define NURUNURU_ROLLING_MAX_VELOCITY_CHANGE_FP 48
+#define NURUNURU_FLICK_MAX_VELOCITY_CHANGE_FP 256
+
 #define NURUNURU_FIXED_SCROLL_DIVISOR 24
 #define NURUNURU_FIXED_BRAKE 1
 
@@ -100,7 +109,7 @@ struct scroll_nurunuru_data {
 
     /*
      * Keep the selected output scale through the inertia tail.
-     * ROLLING uses 1/1; FLICK and undecided/flick-like motion use 2/5.
+     * ROLLING uses 1/1; FLICK and undecided/flick-like motion use 1/3.
      */
     enum scroll_nurunuru_gesture_mode output_mode;
 
@@ -225,6 +234,27 @@ static int32_t smooth_toward(
 
     return current +
            (int32_t)((difference * response) / 100);
+}
+
+static int32_t limit_velocity_change(
+    int32_t current,
+    int32_t target,
+    int32_t maximum_change_fp
+) {
+    if (maximum_change_fp <= 0) {
+        return target;
+    }
+
+    int64_t difference =
+        (int64_t)target - current;
+
+    difference = CLAMP(
+        difference,
+        -(int64_t)maximum_change_fp,
+        (int64_t)maximum_change_fp
+    );
+
+    return current + (int32_t)difference;
 }
 
 static int32_t smoothstep_scaled(int32_t t_scaled) {
@@ -1067,18 +1097,37 @@ static void scroll_nurunuru_work_callback(
                 ? NURUNURU_ROLLING_VELOCITY_RESPONSE
                 : NURUNURU_FLICK_VELOCITY_RESPONSE;
 
-        data->velocity_horizontal_fp =
+        int32_t maximum_velocity_change_fp =
+            data->gesture_mode == NURUNURU_GESTURE_ROLLING
+                ? NURUNURU_ROLLING_MAX_VELOCITY_CHANGE_FP
+                : NURUNURU_FLICK_MAX_VELOCITY_CHANGE_FP;
+
+        int32_t smoothed_horizontal_target_fp =
             smooth_toward(
                 data->velocity_horizontal_fp,
                 target_horizontal_fp,
                 velocity_response
             );
 
-        data->velocity_vertical_fp =
+        int32_t smoothed_vertical_target_fp =
             smooth_toward(
                 data->velocity_vertical_fp,
                 target_vertical_fp,
                 velocity_response
+            );
+
+        data->velocity_horizontal_fp =
+            limit_velocity_change(
+                data->velocity_horizontal_fp,
+                smoothed_horizontal_target_fp,
+                maximum_velocity_change_fp
+            );
+
+        data->velocity_vertical_fp =
+            limit_velocity_change(
+                data->velocity_vertical_fp,
+                smoothed_vertical_target_fp,
+                maximum_velocity_change_fp
             );
     } else {
         bool waiting_for_release =
@@ -1162,7 +1211,7 @@ static void scroll_nurunuru_work_callback(
      * Mode-specific final screen movement scale.
      *
      * ROLLING: 1 / 1
-     * FLICK and its inertia tail: 2 / 5
+     * FLICK and its inertia tail: 1 / 3
      *
      * Scaling happens before integer HID extraction, so fractional movement
      * is retained instead of being rounded away.
@@ -1178,16 +1227,10 @@ static void scroll_nurunuru_work_callback(
         NURUNURU_GESTURE_ROLLING
     ) {
         scaled_horizontal_velocity_fp =
-            (int32_t)(
-                ((int64_t)data->velocity_horizontal_fp * 2) /
-                5
-            );
+            data->velocity_horizontal_fp / 3;
 
         scaled_vertical_velocity_fp =
-            (int32_t)(
-                ((int64_t)data->velocity_vertical_fp * 2) /
-                5
-            );
+            data->velocity_vertical_fp / 3;
     }
 
     data->output_horizontal_fp +=
