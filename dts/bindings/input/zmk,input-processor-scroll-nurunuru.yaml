@@ -10,6 +10,13 @@ properties:
     default: 7
     description: Scroll fineness from 1 to 10. Higher is finer and slower.
 
+  hover:
+    type: int
+    default: 4
+    description: >
+      Initial low-speed push from 1 to 10.
+      Higher values create a stronger floating start.
+
   acceleration:
     type: int
     default: 10

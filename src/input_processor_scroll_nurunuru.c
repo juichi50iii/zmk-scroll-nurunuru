@@ -33,6 +33,7 @@ LOG_MODULE_REGISTER(
 
 struct scroll_nurunuru_config {
     uint8_t scroll_scale;
+    uint8_t hover;
     uint8_t acceleration;
     uint8_t inertia;
     uint8_t brake;
@@ -59,6 +60,53 @@ static int16_t get_scroll_divisor(const struct scroll_nurunuru_config *config) {
 
 static uint16_t get_max_gain_percent(const struct scroll_nurunuru_config *config) {
     return (uint16_t)clamp_tuning(config->acceleration) * 100U;
+}
+
+static int32_t calculate_hover_fp(
+    int32_t raw_value,
+    int16_t scroll_divisor,
+    uint8_t hover,
+    uint8_t hover_frame
+) {
+    hover = clamp_tuning(hover);
+
+    /*
+     * Hover lasts for five worker frames.
+     *
+     * frame 0: 100%
+     * frame 1: 80%
+     * frame 2: 60%
+     * frame 3: 40%
+     * frame 4: 20%
+     * frame 5: 0%
+     */
+    if (hover_frame >= 5) {
+        return 0;
+    }
+
+    int32_t remaining_percent =
+        100 - ((int32_t)hover_frame * 20);
+
+    /*
+     * Hover 1..10 becomes an additional 0.1x..1.0x
+     * of the unaccelerated input.
+     */
+    int64_t result =
+        (int64_t)raw_value *
+        NURUNURU_FP_SCALE *
+        hover *
+        remaining_percent;
+
+    result /=
+        (int64_t)scroll_divisor *
+        10 *
+        100;
+
+    return (int32_t)CLAMP(
+        result,
+        (int64_t)INT32_MIN,
+        (int64_t)INT32_MAX
+    );
 }
 
 static uint8_t get_friction_percent(const struct scroll_nurunuru_config *config) {
@@ -94,6 +142,13 @@ struct scroll_nurunuru_data {
      */
     int32_t velocity_horizontal_fp;
     int32_t velocity_vertical_fp;
+
+    /*
+    * Input-start boost, kept separate from normal velocity.
+    */
+    int32_t hover_horizontal_fp;
+    int32_t hover_vertical_fp;
+    uint8_t hover_frame;
 
     /*
      * Fractional output retained between scroll reports.
@@ -432,6 +487,13 @@ static void scroll_nurunuru_work_callback(
          * This avoids diagonal movement receiving an unexpectedly larger
          * acceleration merely because both axes are active.
          */
+         bool input_just_started =
+        !data->input_was_active;
+
+        if (input_just_started) {
+            data->hover_frame = 0;
+        }
+
         speed =
             max_i32(
                 abs_i32(frame_horizontal),
@@ -485,7 +547,30 @@ static void scroll_nurunuru_work_callback(
                 target_vertical_fp,
                 NURUNURU_VELOCITY_SMOOTHING
             );
+
+        data->hover_horizontal_fp =
+    calculate_hover_fp(
+        frame_horizontal,
+        scroll_divisor,
+        config->hover,
+        data->hover_frame
+    );
+
+    data->hover_vertical_fp =
+        calculate_hover_fp(
+            frame_vertical,
+            scroll_divisor,
+            config->hover,
+            data->hover_frame
+        );
+
+    if (data->hover_frame < 5) {
+        data->hover_frame++;
+    }
+
     } else {
+        data->hover_horizontal_fp = 0;
+        data->hover_vertical_fp = 0;
         /*
          * Sensor reports can have gaps longer than the worker interval.
          * Do not interpret a single empty worker frame as release.
@@ -539,10 +624,12 @@ static void scroll_nurunuru_work_callback(
         (data->input_was_active && idle_ms < NURUNURU_RELEASE_MS);
 
     data->output_horizontal_fp +=
-        data->velocity_horizontal_fp;
+        data->velocity_horizontal_fp +
+        data->hover_horizontal_fp;
 
     data->output_vertical_fp +=
-        data->velocity_vertical_fp;
+        data->velocity_vertical_fp +
+        data->hover_vertical_fp;
 
     output_horizontal =
         extract_scroll_output(
@@ -730,6 +817,10 @@ static int scroll_nurunuru_init(
     data->velocity_horizontal_fp = 0;
     data->velocity_vertical_fp = 0;
 
+    data->hover_horizontal_fp = 0;
+    data->hover_vertical_fp = 0;
+    data->hover_frame = 0;
+
     data->output_horizontal_fp = 0;
     data->output_vertical_fp = 0;
 
@@ -772,6 +863,9 @@ static const struct zmk_input_processor_driver_api
                                                                        \
             .acceleration =                                           \
                 DT_INST_PROP_OR(inst, acceleration, 10),              \
+                                                                        \
+            .hover =                                                    \
+                DT_INST_PROP_OR(inst, hover, 4),                        \
                                                                        \
             .inertia =                                                \
                 DT_INST_PROP_OR(inst, inertia, 8),                    \
