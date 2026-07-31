@@ -49,6 +49,28 @@ LOG_MODULE_REGISTER(
 #define NURUNURU_ROLLING_MAX_VELOCITY_CHANGE_FP 48
 #define NURUNURU_FLICK_MAX_VELOCITY_CHANGE_FP 256
 
+/*
+ * ROLLING-specific smoothing.
+ *
+ * Acceleration is allowed to follow relatively quickly.
+ * Deceleration and temporary sensor gaps are deliberately much slower.
+ */
+#define NURUNURU_ROLLING_ACCEL_RESPONSE 18
+#define NURUNURU_ROLLING_DECEL_RESPONSE 4
+
+/*
+ * Minimum virtual cruise velocity while ROLLING input is active.
+ * This prevents low-speed sensor chatter from becoming visible stop/start.
+ */
+#define NURUNURU_ROLLING_MIN_CRUISE_FP 96
+
+/*
+ * After ROLLING input ends, preserve the last cruise velocity briefly before
+ * normal inertia takes over.
+ */
+#define NURUNURU_ROLLING_COAST_BRIDGE_MS 120
+#define NURUNURU_ROLLING_BRIDGE_RETENTION_PER_MILLE 995
+
 #define NURUNURU_FIXED_SCROLL_DIVISOR 24
 #define NURUNURU_FIXED_BRAKE 1
 
@@ -112,6 +134,15 @@ struct scroll_nurunuru_data {
      * ROLLING uses 1/1; FLICK and undecided/flick-like motion use 1/3.
      */
     enum scroll_nurunuru_gesture_mode output_mode;
+
+    /*
+     * Preserve ROLLING cruise briefly after release so the transition into
+     * inertia is hidden instead of feeling like a mode switch.
+     */
+    bool rolling_bridge_active;
+    uint32_t rolling_bridge_started_ms;
+    int32_t rolling_bridge_horizontal_fp;
+    int32_t rolling_bridge_vertical_fp;
 
     uint8_t gesture_frames;
     int32_t gesture_peak_speed;
@@ -255,6 +286,70 @@ static int32_t limit_velocity_change(
     );
 
     return current + (int32_t)difference;
+}
+
+static int32_t smooth_toward_asymmetric(
+    int32_t current,
+    int32_t target,
+    uint8_t acceleration_response,
+    uint8_t deceleration_response
+) {
+    uint8_t response =
+        abs_i32(target) > abs_i32(current)
+            ? acceleration_response
+            : deceleration_response;
+
+    return smooth_toward(
+        current,
+        target,
+        response
+    );
+}
+
+static int32_t enforce_minimum_cruise(
+    int32_t velocity_fp,
+    int32_t input_value,
+    int32_t minimum_cruise_fp
+) {
+    if (
+        input_value == 0 ||
+        minimum_cruise_fp <= 0
+    ) {
+        return velocity_fp;
+    }
+
+    int8_t direction =
+        sign_i32(input_value);
+
+    if (direction == 0) {
+        return velocity_fp;
+    }
+
+    if (abs_i32(velocity_fp) >= minimum_cruise_fp) {
+        return velocity_fp;
+    }
+
+    return (int32_t)direction *
+           minimum_cruise_fp;
+}
+
+static int32_t apply_retention_per_mille(
+    int32_t value,
+    uint16_t retention_per_mille
+) {
+    retention_per_mille =
+        CLAMP(retention_per_mille, 0, 999);
+
+    int64_t result =
+        ((int64_t)value *
+         retention_per_mille) /
+        1000;
+
+    if (abs_i32((int32_t)result) < 8) {
+        return 0;
+    }
+
+    return (int32_t)result;
 }
 
 static int32_t smoothstep_scaled(int32_t t_scaled) {
@@ -849,6 +944,10 @@ static void scroll_nurunuru_work_callback(
     uint8_t retention_percent = 0;
 
     if (input_is_active) {
+        /*
+         * Any fresh input takes control immediately.
+         */
+        data->rolling_bridge_active = false;
         data->last_input_speed = speed;
 
         if (input_just_started) {
@@ -1102,19 +1201,47 @@ static void scroll_nurunuru_work_callback(
                 ? NURUNURU_ROLLING_MAX_VELOCITY_CHANGE_FP
                 : NURUNURU_FLICK_MAX_VELOCITY_CHANGE_FP;
 
-        int32_t smoothed_horizontal_target_fp =
-            smooth_toward(
-                data->velocity_horizontal_fp,
-                target_horizontal_fp,
-                velocity_response
-            );
+        int32_t smoothed_horizontal_target_fp;
+        int32_t smoothed_vertical_target_fp;
 
-        int32_t smoothed_vertical_target_fp =
-            smooth_toward(
-                data->velocity_vertical_fp,
-                target_vertical_fp,
-                velocity_response
-            );
+        if (
+            data->gesture_mode ==
+            NURUNURU_GESTURE_ROLLING
+        ) {
+            /*
+             * ROLLING follows increases faster than decreases.
+             * Sensor dips and tiny gaps are hidden rather than exposed.
+             */
+            smoothed_horizontal_target_fp =
+                smooth_toward_asymmetric(
+                    data->velocity_horizontal_fp,
+                    target_horizontal_fp,
+                    NURUNURU_ROLLING_ACCEL_RESPONSE,
+                    NURUNURU_ROLLING_DECEL_RESPONSE
+                );
+
+            smoothed_vertical_target_fp =
+                smooth_toward_asymmetric(
+                    data->velocity_vertical_fp,
+                    target_vertical_fp,
+                    NURUNURU_ROLLING_ACCEL_RESPONSE,
+                    NURUNURU_ROLLING_DECEL_RESPONSE
+                );
+        } else {
+            smoothed_horizontal_target_fp =
+                smooth_toward(
+                    data->velocity_horizontal_fp,
+                    target_horizontal_fp,
+                    velocity_response
+                );
+
+            smoothed_vertical_target_fp =
+                smooth_toward(
+                    data->velocity_vertical_fp,
+                    target_vertical_fp,
+                    velocity_response
+                );
+        }
 
         data->velocity_horizontal_fp =
             limit_velocity_change(
@@ -1129,64 +1256,119 @@ static void scroll_nurunuru_work_callback(
                 smoothed_vertical_target_fp,
                 maximum_velocity_change_fp
             );
+
+        if (
+            data->gesture_mode ==
+            NURUNURU_GESTURE_ROLLING
+        ) {
+            data->velocity_horizontal_fp =
+                enforce_minimum_cruise(
+                    data->velocity_horizontal_fp,
+                    frame_horizontal,
+                    NURUNURU_ROLLING_MIN_CRUISE_FP
+                );
+
+            data->velocity_vertical_fp =
+                enforce_minimum_cruise(
+                    data->velocity_vertical_fp,
+                    frame_vertical,
+                    NURUNURU_ROLLING_MIN_CRUISE_FP
+                );
+        }
     } else {
         bool waiting_for_release =
             data->input_was_active &&
             idle_ms < NURUNURU_RELEASE_MS;
 
-        retention_percent =
-            calculate_retention_percent(
-                data->velocity_horizontal_fp,
-                data->velocity_vertical_fp,
-                config
-            );
-
         /*
-         * The release window stays highly slippery so accumulated rolling
-         * momentum flows naturally into inertia instead of falling off.
+         * Start a short bridge when a ROLLING gesture releases.
+         * The bridge holds the last cruise velocity almost unchanged before
+         * handing it to the ordinary inertia path.
          */
-        if (waiting_for_release) {
-            retention_percent =
-                (uint8_t)MIN(
-                    retention_percent + 2,
-                    99
-                );
+        if (
+            data->input_was_active &&
+            data->output_mode ==
+                NURUNURU_GESTURE_ROLLING &&
+            !data->rolling_bridge_active
+        ) {
+            data->rolling_bridge_active = true;
+            data->rolling_bridge_started_ms = now_ms;
+            data->rolling_bridge_horizontal_fp =
+                data->velocity_horizontal_fp;
+            data->rolling_bridge_vertical_fp =
+                data->velocity_vertical_fp;
         }
 
-        bool fast_enough_for_inertia =
-            data->last_input_speed >=
-            inertia_start_speed;
+        bool rolling_bridge_running =
+            data->rolling_bridge_active &&
+            (
+                now_ms -
+                data->rolling_bridge_started_ms
+            ) < NURUNURU_ROLLING_COAST_BRIDGE_MS;
 
-        if (
-            !waiting_for_release &&
-            !fast_enough_for_inertia
-        ) {
-            data->velocity_horizontal_fp = 0;
-            data->velocity_vertical_fp = 0;
-        } else {
-            data->velocity_horizontal_fp =
-                apply_retention(
-                    data->velocity_horizontal_fp,
-                    retention_percent
+        if (rolling_bridge_running) {
+            data->rolling_bridge_horizontal_fp =
+                apply_retention_per_mille(
+                    data->rolling_bridge_horizontal_fp,
+                    NURUNURU_ROLLING_BRIDGE_RETENTION_PER_MILLE
                 );
+
+            data->rolling_bridge_vertical_fp =
+                apply_retention_per_mille(
+                    data->rolling_bridge_vertical_fp,
+                    NURUNURU_ROLLING_BRIDGE_RETENTION_PER_MILLE
+                );
+
+            data->velocity_horizontal_fp =
+                data->rolling_bridge_horizontal_fp;
 
             data->velocity_vertical_fp =
-                apply_retention(
+                data->rolling_bridge_vertical_fp;
+        } else {
+            data->rolling_bridge_active = false;
+
+            retention_percent =
+                calculate_retention_percent(
+                    data->velocity_horizontal_fp,
                     data->velocity_vertical_fp,
-                    retention_percent
+                    config
                 );
+
+            if (waiting_for_release) {
+                retention_percent =
+                    (uint8_t)MIN(
+                        retention_percent + 2,
+                        99
+                    );
+            }
+
+            bool fast_enough_for_inertia =
+                data->last_input_speed >=
+                inertia_start_speed;
+
+            if (
+                !waiting_for_release &&
+                !fast_enough_for_inertia
+            ) {
+                data->velocity_horizontal_fp = 0;
+                data->velocity_vertical_fp = 0;
+            } else {
+                data->velocity_horizontal_fp =
+                    apply_retention(
+                        data->velocity_horizontal_fp,
+                        retention_percent
+                    );
+
+                data->velocity_vertical_fp =
+                    apply_retention(
+                        data->velocity_vertical_fp,
+                        retention_percent
+                    );
+            }
         }
 
-        /*
-         * Rolling momentum has already been blended into velocity.
-         * Clear the separate target state without affecting the glide.
-         */
         data->rolling_horizontal_fp = 0;
         data->rolling_vertical_fp = 0;
-        data->rolling_lpf_horizontal_fp = 0;
-        data->rolling_lpf_vertical_fp = 0;
-        data->cruise_horizontal_fp = 0;
-        data->cruise_vertical_fp = 0;
         data->hover_active = false;
 
         if (idle_ms >= NURUNURU_RELEASE_MS) {
@@ -1275,12 +1457,16 @@ static void scroll_nurunuru_work_callback(
         horizontal_stopped ||
         vertical_stopped;
 
+    bool rolling_bridge_is_active =
+        data->rolling_bridge_active;
+
     bool inertia_is_allowed =
         idle_ms < inertia_timeout_ms;
 
     bool continue_running =
         input_is_active ||
         stop_window_is_active ||
+        rolling_bridge_is_active ||
         (velocity_is_active && inertia_is_allowed);
 
     if (continue_running) {
@@ -1296,6 +1482,10 @@ static void scroll_nurunuru_work_callback(
 
         data->rolling_horizontal_fp = 0;
         data->rolling_vertical_fp = 0;
+
+        data->rolling_bridge_active = false;
+        data->rolling_bridge_horizontal_fp = 0;
+        data->rolling_bridge_vertical_fp = 0;
 
         data->hover_active = false;
         data->rolling_frames = 0;
@@ -1438,6 +1628,12 @@ static int scroll_nurunuru_init(
         NURUNURU_GESTURE_UNDECIDED;
     data->output_mode =
         NURUNURU_GESTURE_FLICK;
+
+    data->rolling_bridge_active = false;
+    data->rolling_bridge_started_ms = 0;
+    data->rolling_bridge_horizontal_fp = 0;
+    data->rolling_bridge_vertical_fp = 0;
+
     data->gesture_frames = 0;
     data->gesture_peak_speed = 0;
 
