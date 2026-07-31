@@ -47,6 +47,15 @@ LOG_MODULE_REGISTER(
 #define NURUNURU_ROLL_MAX_SPEED 5
 #define NURUNURU_ROLL_MAX_PEAK_SPEED 7
 
+/*
+ * Final screen movement scale.
+ *
+ * 1 / 2 = half distance
+ * 1 / 3 = one-third distance
+ */
+#define NURUNURU_OUTPUT_SCALE_NUMERATOR 1
+#define NURUNURU_OUTPUT_SCALE_DENOMINATOR 2
+
 enum scroll_nurunuru_gesture_mode {
     NURUNURU_GESTURE_UNDECIDED = 0,
     NURUNURU_GESTURE_FLICK,
@@ -1151,10 +1160,18 @@ static void scroll_nurunuru_work_callback(
         );
 
     data->output_horizontal_fp +=
-        data->velocity_horizontal_fp;
+        (int32_t)(
+            ((int64_t)data->velocity_horizontal_fp *
+            NURUNURU_OUTPUT_SCALE_NUMERATOR) /
+            NURUNURU_OUTPUT_SCALE_DENOMINATOR
+        );
 
     data->output_vertical_fp +=
-        data->velocity_vertical_fp;
+        (int32_t)(
+            ((int64_t)data->velocity_vertical_fp *
+            NURUNURU_OUTPUT_SCALE_NUMERATOR) /
+            NURUNURU_OUTPUT_SCALE_DENOMINATOR
+        );
 
     output_horizontal =
         extract_scroll_output(
