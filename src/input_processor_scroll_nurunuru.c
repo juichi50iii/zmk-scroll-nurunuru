@@ -37,6 +37,7 @@ struct scroll_nurunuru_config {
     uint8_t inertia;
     uint8_t brake;
 
+    bool track_remainders;
     bool invert_horizontal;
     bool invert_vertical;
 };
@@ -778,6 +779,10 @@ static const struct zmk_input_processor_driver_api
             .brake =                                                  \
                 DT_INST_PROP_OR(inst, brake, 3),                      \
                                                                        \
+                                                                        \
+            .track_remainders =                                         \
+                DT_INST_PROP_OR( inst, track_remainders, true ),        \
+                                                                        \
             .invert_horizontal =                                      \
                 DT_INST_PROP_OR(                                      \
                     inst,                                             \
