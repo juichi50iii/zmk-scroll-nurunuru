@@ -1,0 +1,58 @@
+description: >
+  Fixed-rate scrolling input processor for ZMK.
+
+  The processor consumes relative X and Y input events, accumulates their
+  values, and emits horizontal and vertical scroll reports at a fixed
+  interval.
+
+compatible: "zmk,input-processor-scroll-nurunuru"
+
+include: base.yaml
+
+properties:
+  "#input-processor-cells":
+    type: int
+    required: true
+    const: 0
+
+  track-remainders:
+    type: boolean
+    description: >
+      Indicates whether the ZMK input listener should allocate remainder
+      storage for this processor. This processor keeps its own remainders.
+
+  report-interval-ms:
+    type: int
+    default: 8
+    description: >
+      Interval in milliseconds between generated scroll reports.
+
+  horizontal-divisor:
+    type: int
+    default: 15
+    description: >
+      Raw horizontal movement required to generate one horizontal scroll
+      unit.
+
+  vertical-divisor:
+    type: int
+    default: 15
+    description: >
+      Raw vertical movement required to generate one vertical scroll unit.
+
+  idle-timeout-ms:
+    type: int
+    default: 40
+    description: >
+      Stop the periodic worker after this amount of time without physical
+      input.
+
+  invert-horizontal:
+    type: boolean
+    description: >
+      Invert horizontal scrolling.
+
+  invert-vertical:
+    type: boolean
+    description: >
+      Invert vertical scrolling.

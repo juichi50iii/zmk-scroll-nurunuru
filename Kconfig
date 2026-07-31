@@ -1,0 +1,22 @@
+menuconfig ZMK_SCROLL_NURUNURU
+    bool "ZMK Scroll Nurunuru"
+    default y
+    help
+      Enables the zmk-scroll-nurunuru input processor.
+
+if ZMK_SCROLL_NURUNURU
+
+config ZMK_SCROLL_NURUNURU_LOG_LEVEL
+    int "Log level"
+    default 2
+    range 0 4
+    help
+      Log level for zmk-scroll-nurunuru.
+
+      0 = Off
+      1 = Error
+      2 = Warning
+      3 = Info
+      4 = Debug
+
+endif
