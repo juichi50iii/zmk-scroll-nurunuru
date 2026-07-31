@@ -52,8 +52,6 @@ struct scroll_nurunuru_config {
     uint16_t acceleration_end;
     uint16_t max_gain_percent;
 
-    uint16_t idle_timeout_ms;
-
     bool invert_horizontal;
     bool invert_vertical;
 };
@@ -230,6 +228,23 @@ static int32_t apply_gain(
     );
 }
 
+static int32_t apply_friction(
+    int32_t velocity_fp,
+    uint8_t friction_percent
+) {
+    friction_percent =
+        CLAMP(friction_percent, 0, 99);
+
+    int64_t reduced =
+        ((int64_t)velocity_fp * friction_percent) / 100;
+
+    if (abs_i32((int32_t)reduced) < 8) {
+        return 0;
+    }
+
+    return (int32_t)reduced;
+}
+
 static int32_t raw_to_velocity_fp(
     int32_t raw_value,
     int16_t divisor
@@ -396,11 +411,22 @@ static void scroll_nurunuru_work_callback(
                 config->velocity_smoothing
             );
     } else {
-        /*
-         * Phase 3 still has no inertia.
-         */
-        data->velocity_horizontal_fp = 0;
-        data->velocity_vertical_fp = 0;
+    /*
+     * No new physical movement arrived during this frame.
+     *
+     * Retain part of the previous velocity to create inertia.
+     */
+    data->velocity_horizontal_fp =
+        apply_friction(
+            data->velocity_horizontal_fp,
+            config->friction_percent
+        );
+
+    data->velocity_vertical_fp =
+        apply_friction(
+            data->velocity_vertical_fp,
+            config->friction_percent
+        );
     }
 
     data->output_horizontal_fp +=
@@ -427,8 +453,16 @@ static void scroll_nurunuru_work_callback(
         output_vertical = -output_vertical;
     }
 
+    bool velocity_is_active =
+    data->velocity_horizontal_fp != 0 ||
+    data->velocity_vertical_fp != 0;
+
+    bool inertia_is_allowed =
+        idle_ms < config->inertia_timeout_ms;
+
     bool continue_running =
-        idle_ms < config->idle_timeout_ms;
+        input_is_active ||
+        (velocity_is_active && inertia_is_allowed);
 
     if (continue_running) {
         k_work_reschedule(
@@ -636,18 +670,25 @@ static const struct zmk_input_processor_driver_api
                 ),                                                    \
                                                                        \
             .max_gain_percent =                                       \
-                DT_INST_PROP_OR(                                      \
-                    inst,                                             \
-                    max_gain_percent,                                 \
-                    300                                               \
-                ),                                                    \
+                DT_INST_PROP_OR(                                       \
+                    inst,                                              \
+                    max_gain_percent,                                  \
+                    300                                                \
+                ),                                                     \
                                                                        \
-            .idle_timeout_ms =                                        \
-                DT_INST_PROP_OR(                                      \
-                    inst,                                             \
-                    idle_timeout_ms,                                  \
-                    40                                                \
-                ),                                                    \
+            .friction_percent =                                        \
+                DT_INST_PROP_OR(                                        \
+                    inst,                                               \
+                    friction_percent,                                   \
+                    86                                                  \
+                ),                                                      \
+                                                                        \
+            .inertia_timeout_ms =                                       \
+                DT_INST_PROP_OR(                                        \
+                    inst,                                               \
+                    inertia_timeout_ms,                                 \
+                    300                                                 \
+                ),                                                      \
                                                                        \
             .invert_horizontal =                                      \
                 DT_INST_PROP_OR(                                      \

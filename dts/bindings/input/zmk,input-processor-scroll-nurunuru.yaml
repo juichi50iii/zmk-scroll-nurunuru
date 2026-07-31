@@ -82,3 +82,17 @@ properties:
     description: >
       Maximum scrolling gain in percent.
       100 means no acceleration and 300 means three times the base speed.
+
+  friction-percent:
+    type: int
+    default: 86
+    description: >
+      Percentage of velocity retained on each frame after physical input
+      stops. Higher values produce longer inertia. Valid range is 0 to 99.
+
+  inertia-timeout-ms:
+    type: int
+    default: 300
+    description: >
+      Maximum time in milliseconds that inertia may continue after the
+      latest physical input.
