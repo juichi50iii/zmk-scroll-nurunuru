@@ -265,10 +265,10 @@ static int scroll_nurunuru_handle_event(
     );
 
     if (event->code == INPUT_REL_X) {
-        data->pending_x +=
+        data->pending_y +=
             event->value;
     } else {
-        data->pending_y +=
+        data->pending_x +=
             event->value;
     }
 
