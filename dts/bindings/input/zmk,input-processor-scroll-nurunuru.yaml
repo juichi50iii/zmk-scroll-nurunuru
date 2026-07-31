@@ -1,39 +1,43 @@
-description: Smooth inertial scrolling input processor
+description: Smooth force-based inertial scrolling input processor
 
 compatible: "zmk,input-processor-scroll-nurunuru"
 
 include: base.yaml
 
 properties:
+  "#input-processor-cells":
+    type: int
+    required: true
+    const: 0
+
+  track-remainders:
+    type: boolean
+    description: Required by the ZMK input listener remainder tracker.
+
   scroll-scale:
     type: int
     default: 7
     description: Scroll fineness from 1 to 10. Higher is finer and slower.
 
-  hover:
-    type: int
-    default: 4
-    description: >
-      Initial low-speed push from 1 to 10.
-      Higher values create a stronger floating start.
-
   acceleration:
     type: int
     default: 10
-    description: Acceleration strength from 1 to 10.
+    description: Input acceleration strength from 1 to 10.
+
+  hover:
+    type: int
+    default: 4
+    description: Initial low-speed push from 1 to 10.
 
   inertia:
     type: int
     default: 8
-    description: Coasting strength from 1 to 10. Higher glides longer.
+    description: Motion retention from 1 to 10. Higher glides longer.
 
   brake:
     type: int
     default: 3
-    description: End braking strength from 1 to 10. Higher stops more strongly.
-
-  track-remainders:
-    type: boolean
+    description: Low-speed braking from 1 to 10. Higher stops more strongly.
 
   invert-horizontal:
     type: boolean
