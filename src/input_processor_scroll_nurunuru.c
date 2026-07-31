@@ -53,6 +53,7 @@ struct scroll_nurunuru_config {
     uint16_t max_gain_percent;
 
     uint8_t friction_percent;
+    uint16_t inertia_start_speed;
     uint16_t inertia_timeout_ms;
 
     bool invert_horizontal;
@@ -84,6 +85,9 @@ struct scroll_nurunuru_data {
      */
     int32_t output_horizontal_fp;
     int32_t output_vertical_fp;
+
+    int32_t last_input_speed;
+    bool input_was_active;
 
     uint32_t last_input_ms;
 
@@ -368,6 +372,8 @@ static void scroll_nurunuru_work_callback(
                 abs_i32(frame_vertical)
             );
 
+        data->last_input_speed = speed;
+
         gain_scaled =
             calculate_gain_scaled(
                 speed,
@@ -415,22 +421,44 @@ static void scroll_nurunuru_work_callback(
             );
     } else {
     /*
-     * No new physical movement arrived during this frame.
-     *
-     * Retain part of the previous velocity to create inertia.
+     * Decide whether inertia should begin on the first frame after
+     * physical movement stops.
      */
-    data->velocity_horizontal_fp =
-        apply_friction(
-            data->velocity_horizontal_fp,
-            config->friction_percent
-        );
+        bool input_just_stopped =
+            data->input_was_active;
 
-    data->velocity_vertical_fp =
-        apply_friction(
-            data->velocity_vertical_fp,
-            config->friction_percent
-        );
+        bool fast_enough_for_inertia =
+            data->last_input_speed >=
+            config->inertia_start_speed;
+
+        if (
+            input_just_stopped &&
+            !fast_enough_for_inertia
+        ) {
+            /*
+            * Slow, deliberate movement should stop immediately.
+            */
+            data->velocity_horizontal_fp = 0;
+            data->velocity_vertical_fp = 0;
+        } else {
+            /*
+            * A sufficiently fast gesture continues with friction.
+            */
+            data->velocity_horizontal_fp =
+                apply_friction(
+                    data->velocity_horizontal_fp,
+                    config->friction_percent
+                );
+
+            data->velocity_vertical_fp =
+                apply_friction(
+                    data->velocity_vertical_fp,
+                    config->friction_percent
+                );
+        }
     }
+    data->input_was_active =
+        input_is_active;
 
     data->output_horizontal_fp +=
         data->velocity_horizontal_fp;
@@ -599,6 +627,9 @@ static int scroll_nurunuru_init(
     data->output_horizontal_fp = 0;
     data->output_vertical_fp = 0;
 
+    data->last_input_speed = 0;
+    data->input_was_active = false;
+
     data->last_input_ms = 0;
     data->worker_running = false;
 
@@ -684,6 +715,13 @@ static const struct zmk_input_processor_driver_api
                     inst,                                               \
                     friction_percent,                                   \
                     86                                                  \
+                ),                                                      \
+                                                                        \
+            .inertia_start_speed =                                      \
+                DT_INST_PROP_OR(                                        \
+                    inst,                                               \
+                    inertia_start_speed,                                \
+                    6                                                   \
                 ),                                                      \
                                                                         \
             .inertia_timeout_ms =                                       \

@@ -96,3 +96,10 @@ properties:
     description: >
       Maximum time in milliseconds that inertia may continue after the
       latest physical input.
+
+  inertia-start-speed:
+    type: int
+    default: 6
+    description: >
+      Minimum raw movement per frame required to start inertia.
+      Slower movement stops immediately when physical input ends.
