@@ -28,6 +28,7 @@ struct scroll_nurunuru_config {
     uint8_t response;
     uint16_t drag_per_mille;
     uint16_t stop_threshold;
+    uint16_t input_gap_hold_ms;
     bool invert_horizontal;
     bool invert_vertical;
 };
@@ -44,8 +45,12 @@ struct scroll_nurunuru_data {
     int32_t velocity_vertical_fp;
     int32_t output_horizontal_fp;
     int32_t output_vertical_fp;
+    int32_t target_horizontal_fp;
+    int32_t target_vertical_fp;
     uint32_t last_input_ms;
     uint32_t last_sample_ms;
+    uint32_t last_horizontal_input_ms;
+    uint32_t last_vertical_input_ms;
 };
 
 static int32_t abs_i32(int32_t value) {
@@ -191,17 +196,32 @@ static void scroll_nurunuru_work_callback(struct k_work *work) {
                                1000) /
                               dt_ms);
     int32_t gain = calculate_gain(config, speed);
-    int32_t target_horizontal =
-        calculate_target_velocity_fp(frame_horizontal, dt_ms, gain);
-    int32_t target_vertical =
-        calculate_target_velocity_fp(frame_vertical, dt_ms, gain);
+    if (frame_horizontal != 0) {
+        data->target_horizontal_fp =
+            calculate_target_velocity_fp(frame_horizontal, dt_ms, gain);
+        data->last_horizontal_input_ms = now_ms;
+    }
+    if (frame_vertical != 0) {
+        data->target_vertical_fp =
+            calculate_target_velocity_fp(frame_vertical, dt_ms, gain);
+        data->last_vertical_input_ms = now_ms;
+    }
 
-    update_axis(frame_horizontal, target_horizontal, &data->velocity_horizontal_fp,
+    bool horizontal_active =
+        frame_horizontal != 0 ||
+        (data->last_horizontal_input_ms != 0 &&
+         (now_ms - data->last_horizontal_input_ms) < config->input_gap_hold_ms);
+    bool vertical_active =
+        frame_vertical != 0 ||
+        (data->last_vertical_input_ms != 0 &&
+         (now_ms - data->last_vertical_input_ms) < config->input_gap_hold_ms);
+
+    update_axis(frame_horizontal, data->target_horizontal_fp, &data->velocity_horizontal_fp,
                 &data->output_horizontal_fp, config->response, config->drag_per_mille,
-                config->stop_threshold, input_active);
-    update_axis(frame_vertical, target_vertical, &data->velocity_vertical_fp,
+                config->stop_threshold, horizontal_active);
+    update_axis(frame_vertical, data->target_vertical_fp, &data->velocity_vertical_fp,
                 &data->output_vertical_fp, config->response, config->drag_per_mille,
-                config->stop_threshold, input_active);
+                config->stop_threshold, vertical_active);
 
     data->output_horizontal_fp += data->velocity_horizontal_fp;
     data->output_vertical_fp += data->velocity_vertical_fp;
@@ -219,7 +239,7 @@ static void scroll_nurunuru_work_callback(struct k_work *work) {
                            data->velocity_vertical_fp != 0;
     bool release_pending = (now_ms - data->last_input_ms) < INPUT_RELEASE_MS;
 
-    if (input_active || velocity_active || release_pending) {
+    if (input_active || horizontal_active || vertical_active || velocity_active || release_pending) {
         k_work_reschedule(&data->work, K_MSEC(REPORT_INTERVAL_MS));
     } else {
         data->worker_running = false;
@@ -301,6 +321,7 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
         .response = DT_INST_PROP(inst, response),                                 \
         .drag_per_mille = DT_INST_PROP(inst, drag_per_mille),                     \
         .stop_threshold = DT_INST_PROP(inst, stop_threshold),                     \
+        .input_gap_hold_ms = DT_INST_PROP(inst, input_gap_hold_ms),               \
         .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),     \
         .invert_vertical = DT_INST_PROP_OR(inst, invert_vertical, false),         \
     };                                                                            \

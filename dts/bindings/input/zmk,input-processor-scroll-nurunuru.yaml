@@ -49,6 +49,11 @@ properties:
     default: 150
     description: Fixed-point velocity below which inertia stops.
 
+  input-gap-hold-ms:
+    type: int
+    default: 48
+    description: Hold the latest target velocity across brief low-speed sensor gaps.
+
   invert-horizontal:
     type: boolean
 
