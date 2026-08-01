@@ -1,4 +1,4 @@
-description: Time-curve animated high-resolution scrolling input processor
+description: PMW3610-style sigmoid scroll acceleration input processor
 compatible: "zmk,input-processor-scroll-nurunuru"
 include: base.yaml
 
@@ -9,65 +9,14 @@ properties:
     const: 0
   track-remainders:
     type: boolean
-  base-gain:
+  scroll-tick:
     type: int
-    default: 400
-  max-gain:
-    type: int
-    default: 800
-  acceleration-start:
-    type: int
-    default: 600
-  acceleration-end:
-    type: int
-    default: 2200
-  target-response:
-    type: int
-    default: 30
-    description: Percentage used to stabilize successive measured target speeds.
-  velocity-response:
-    type: int
-    default: 25
-    description: Percentage of target camera velocity adopted per 8 ms frame.
-  distance-divisor:
+    default: 20
+    description: Raw sensor counts required for one high-resolution wheel event.
+  sensitivity:
     type: int
     default: 2
-  max-velocity-per-mille:
-    type: int
-    default: 2000
-    description: Maximum high-resolution wheel units per 8 ms frame, in thousandths.
-  coast-velocity-per-mille:
-    type: int
-    default: 400
-    description: Fraction of the live velocity retained when a flick begins.
-  low-speed-response:
-    type: int
-    default: 60
-    description: Percentage of target velocity adopted per frame below 0.25 units.
-  coast-ms:
-    type: int
-    default: 520
-    description: Duration of the zero-slope smootherstep release curve.
-  release-ms:
-    type: int
-    default: 48
-    description: Sensor gap tolerated before beginning the release curve.
-  stage-thresholds:
-    type: array
-    required: true
-    description: Six ascending ball-speed boundaries selecting stages A through G.
-  stage-velocities-per-mille:
-    type: array
-    required: true
-    description: Seven S-curve camera velocities in thousandths of a wheel unit per frame.
-  stage-hysteresis-per-mille:
-    type: int
-    default: 800
-    description: Fraction of each upward boundary used when returning to a slower stage.
-  low-stage-max-gap-ms:
-    type: array
-    required: true
-    description: Maximum time without a report at stages A, B, and C before one predictive step.
+    description: Sigmoid acceleration sensitivity from 1 to 10.
   invert-horizontal:
     type: boolean
   invert-vertical:
