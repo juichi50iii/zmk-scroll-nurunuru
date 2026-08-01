@@ -32,10 +32,18 @@ properties:
   distance-divisor:
     type: int
     default: 2
-  max-velocity:
+  max-velocity-per-mille:
     type: int
-    default: 2
-    description: Maximum high-resolution wheel units per 8 ms frame.
+    default: 2000
+    description: Maximum high-resolution wheel units per 8 ms frame, in thousandths.
+  coast-velocity-per-mille:
+    type: int
+    default: 400
+    description: Fraction of the live velocity retained when a flick begins.
+  low-speed-response:
+    type: int
+    default: 60
+    description: Percentage of target velocity adopted per frame below 0.25 units.
   coast-ms:
     type: int
     default: 520

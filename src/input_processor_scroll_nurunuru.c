@@ -26,7 +26,9 @@ struct scroll_nurunuru_config {
     uint8_t target_response;
     uint8_t velocity_response;
     uint16_t distance_divisor;
-    uint16_t max_velocity;
+    uint16_t max_velocity_per_mille;
+    uint16_t coast_velocity_per_mille;
+    uint8_t low_speed_response;
     uint16_t coast_ms;
     uint16_t release_ms;
     bool invert_horizontal;
@@ -115,7 +117,8 @@ static int32_t calculate_target_fp(int32_t raw_delta, uint32_t dt_ms, int32_t ga
     int64_t target = (int64_t)raw_delta * REPORT_INTERVAL_MS * FP_SCALE * gain;
     target /= (int64_t)MAX(dt_ms, 1U) * CURVE_SCALE *
               MAX(config->distance_divisor, 1);
-    int32_t maximum = (int32_t)config->max_velocity * FP_SCALE;
+    int32_t maximum = (int32_t)(((int64_t)config->max_velocity_per_mille * FP_SCALE) /
+                                CURVE_SCALE);
     return (int32_t)CLAMP(target, -(int64_t)maximum, (int64_t)maximum);
 }
 
@@ -157,15 +160,20 @@ static int32_t animate_axis(struct axis_animation *axis, uint32_t now_ms,
                       (now_ms - axis->last_input_ms) < config->release_ms;
 
     if (input_held) {
+        uint8_t response = abs_i32(axis->target_fp) < (FP_SCALE / 4)
+                               ? config->low_speed_response
+                               : config->velocity_response;
         axis->velocity_fp = smooth_toward(axis->velocity_fp, axis->target_fp,
-                                          config->velocity_response);
+                                          response);
         return axis->velocity_fp;
     }
 
     if (!axis->coasting && axis->velocity_fp != 0) {
         axis->coasting = true;
         axis->coast_started_ms = now_ms;
-        axis->release_velocity_fp = axis->velocity_fp;
+        axis->release_velocity_fp =
+            (int32_t)(((int64_t)axis->velocity_fp * config->coast_velocity_per_mille) /
+                      CURVE_SCALE);
     }
 
     if (axis->coasting) {
@@ -307,7 +315,10 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
         .target_response = DT_INST_PROP(inst, target_response),                   \
         .velocity_response = DT_INST_PROP(inst, velocity_response),               \
         .distance_divisor = DT_INST_PROP(inst, distance_divisor),                 \
-        .max_velocity = DT_INST_PROP(inst, max_velocity),                         \
+        .max_velocity_per_mille = DT_INST_PROP(inst, max_velocity_per_mille),     \
+        .coast_velocity_per_mille =                                               \
+            DT_INST_PROP(inst, coast_velocity_per_mille),                         \
+        .low_speed_response = DT_INST_PROP(inst, low_speed_response),             \
         .coast_ms = DT_INST_PROP(inst, coast_ms),                                 \
         .release_ms = DT_INST_PROP(inst, release_ms),                             \
         .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),     \
