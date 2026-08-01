@@ -24,11 +24,9 @@ struct scroll_nurunuru_config {
     uint16_t acceleration_start;
     uint16_t acceleration_end;
     uint8_t target_response;
+    uint8_t velocity_response;
     uint16_t distance_divisor;
     uint16_t max_velocity;
-    uint16_t rolling_ramp_ms;
-    uint16_t flick_ramp_ms;
-    uint16_t flick_speed_threshold;
     uint16_t coast_ms;
     uint16_t release_ms;
     bool invert_horizontal;
@@ -38,12 +36,9 @@ struct scroll_nurunuru_config {
 struct axis_animation {
     int32_t target_fp;
     int32_t velocity_fp;
-    int32_t ramp_origin_fp;
     int32_t release_velocity_fp;
-    uint32_t ramp_started_ms;
     uint32_t coast_started_ms;
     uint32_t last_input_ms;
-    uint16_t ramp_duration_ms;
     bool coasting;
 };
 
@@ -93,10 +88,6 @@ static int32_t smootherstep(int32_t x) {
     return (int32_t)((x3 * inner) / CURVE_SCALE);
 }
 
-static int32_t interpolate(int32_t from, int32_t to, int32_t progress) {
-    return from + (int32_t)(((int64_t)(to - from) * progress) / CURVE_SCALE);
-}
-
 static int32_t smooth_toward(int32_t current, int32_t target, uint8_t response) {
     response = CLAMP(response, 1, 100);
     return current + (int32_t)(((int64_t)(target - current) * response) / 100);
@@ -142,8 +133,7 @@ static void accept_axis_input(struct axis_animation *axis, int32_t raw_delta, ui
 
     bool reversing = axis->velocity_fp != 0 &&
                      sign_i32(target) != sign_i32(axis->velocity_fp);
-    bool starting = axis->last_input_ms == 0 || axis->coasting ||
-                    (now_ms - axis->last_input_ms) >= config->release_ms;
+    bool starting = axis->last_input_ms == 0 || axis->coasting;
 
     if (reversing) {
         axis->velocity_fp = 0;
@@ -152,11 +142,6 @@ static void accept_axis_input(struct axis_animation *axis, int32_t raw_delta, ui
     }
 
     if (starting) {
-        axis->ramp_origin_fp = axis->velocity_fp;
-        axis->ramp_started_ms = now_ms;
-        axis->ramp_duration_ms =
-            speed >= config->flick_speed_threshold ? config->flick_ramp_ms
-                                                    : config->rolling_ramp_ms;
         axis->coasting = false;
         axis->target_fp = target;
     } else {
@@ -172,14 +157,8 @@ static int32_t animate_axis(struct axis_animation *axis, uint32_t now_ms,
                       (now_ms - axis->last_input_ms) < config->release_ms;
 
     if (input_held) {
-        uint32_t elapsed = now_ms - axis->ramp_started_ms;
-        int32_t progress = axis->ramp_duration_ms == 0
-                               ? CURVE_SCALE
-                               : (int32_t)MIN((elapsed * CURVE_SCALE) /
-                                                  axis->ramp_duration_ms,
-                                              (uint32_t)CURVE_SCALE);
-        axis->velocity_fp = interpolate(axis->ramp_origin_fp, axis->target_fp,
-                                        smootherstep(progress));
+        axis->velocity_fp = smooth_toward(axis->velocity_fp, axis->target_fp,
+                                          config->velocity_response);
         return axis->velocity_fp;
     }
 
@@ -326,11 +305,9 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
         .acceleration_start = DT_INST_PROP(inst, acceleration_start),             \
         .acceleration_end = DT_INST_PROP(inst, acceleration_end),                 \
         .target_response = DT_INST_PROP(inst, target_response),                   \
+        .velocity_response = DT_INST_PROP(inst, velocity_response),               \
         .distance_divisor = DT_INST_PROP(inst, distance_divisor),                 \
         .max_velocity = DT_INST_PROP(inst, max_velocity),                         \
-        .rolling_ramp_ms = DT_INST_PROP(inst, rolling_ramp_ms),                   \
-        .flick_ramp_ms = DT_INST_PROP(inst, flick_ramp_ms),                       \
-        .flick_speed_threshold = DT_INST_PROP(inst, flick_speed_threshold),       \
         .coast_ms = DT_INST_PROP(inst, coast_ms),                                 \
         .release_ms = DT_INST_PROP(inst, release_ms),                             \
         .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),     \
