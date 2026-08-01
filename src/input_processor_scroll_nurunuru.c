@@ -17,6 +17,8 @@ LOG_MODULE_REGISTER(zmk_scroll_nurunuru, CONFIG_ZMK_SCROLL_NURUNURU_LOG_LEVEL);
 #define CURVE_SCALE 1000
 #define REPORT_INTERVAL_MS 8
 #define MAX_SAMPLE_MS 120
+#define STAGE_COUNT 7
+#define STAGE_THRESHOLD_COUNT (STAGE_COUNT - 1)
 
 struct scroll_nurunuru_config {
     uint16_t base_gain;
@@ -31,6 +33,9 @@ struct scroll_nurunuru_config {
     uint8_t low_speed_response;
     uint16_t coast_ms;
     uint16_t release_ms;
+    uint16_t stage_thresholds[STAGE_THRESHOLD_COUNT];
+    uint16_t stage_velocities_per_mille[STAGE_COUNT];
+    uint16_t stage_hysteresis_per_mille;
     bool invert_horizontal;
     bool invert_vertical;
 };
@@ -42,6 +47,8 @@ struct axis_animation {
     uint32_t coast_started_ms;
     uint32_t last_input_ms;
     bool coasting;
+    uint8_t stage;
+    bool stage_initialized;
 };
 
 struct scroll_nurunuru_data {
@@ -95,31 +102,33 @@ static int32_t smooth_toward(int32_t current, int32_t target, uint8_t response) 
     return current + (int32_t)(((int64_t)(target - current) * response) / 100);
 }
 
-static int32_t calculate_gain(const struct scroll_nurunuru_config *config, int32_t speed) {
-    if (speed <= config->acceleration_start) {
-        return config->base_gain;
-    }
-    if (speed >= config->acceleration_end) {
-        return config->max_gain;
+static uint8_t select_stage(struct axis_animation *axis, int32_t speed,
+                            const struct scroll_nurunuru_config *config) {
+    if (!axis->stage_initialized) {
+        axis->stage = 0;
+        while (axis->stage < STAGE_THRESHOLD_COUNT &&
+               speed >= config->stage_thresholds[axis->stage]) {
+            axis->stage++;
+        }
+        axis->stage_initialized = true;
+        return axis->stage;
     }
 
-    int32_t progress = (int32_t)(((int64_t)(speed - config->acceleration_start) *
-                                  CURVE_SCALE) /
-                                 (config->acceleration_end - config->acceleration_start));
-    int32_t curve = smootherstep(progress);
-    return config->base_gain +
-           (int32_t)(((int64_t)(config->max_gain - config->base_gain) * curve) /
-                     CURVE_SCALE);
-}
-
-static int32_t calculate_target_fp(int32_t raw_delta, uint32_t dt_ms, int32_t gain,
-                                   const struct scroll_nurunuru_config *config) {
-    int64_t target = (int64_t)raw_delta * REPORT_INTERVAL_MS * FP_SCALE * gain;
-    target /= (int64_t)MAX(dt_ms, 1U) * CURVE_SCALE *
-              MAX(config->distance_divisor, 1);
-    int32_t maximum = (int32_t)(((int64_t)config->max_velocity_per_mille * FP_SCALE) /
-                                CURVE_SCALE);
-    return (int32_t)CLAMP(target, -(int64_t)maximum, (int64_t)maximum);
+    while (axis->stage < STAGE_THRESHOLD_COUNT &&
+           speed >= config->stage_thresholds[axis->stage]) {
+        axis->stage++;
+    }
+    while (axis->stage > 0) {
+        int32_t return_threshold =
+            (int32_t)(((int64_t)config->stage_thresholds[axis->stage - 1] *
+                       config->stage_hysteresis_per_mille) /
+                      CURVE_SCALE);
+        if (speed >= return_threshold) {
+            break;
+        }
+        axis->stage--;
+    }
+    return axis->stage;
 }
 
 static void accept_axis_input(struct axis_animation *axis, int32_t raw_delta, uint32_t now_ms,
@@ -132,7 +141,11 @@ static void accept_axis_input(struct axis_animation *axis, int32_t raw_delta, ui
                                                : now_ms - axis->last_input_ms;
     dt_ms = CLAMP(dt_ms, 1U, (uint32_t)MAX_SAMPLE_MS);
     int32_t speed = (int32_t)(((int64_t)abs_i32(raw_delta) * 1000) / dt_ms);
-    int32_t target = calculate_target_fp(raw_delta, dt_ms, calculate_gain(config, speed), config);
+    uint8_t stage = select_stage(axis, speed, config);
+    int32_t target = (int32_t)(((int64_t)config->stage_velocities_per_mille[stage] *
+                                FP_SCALE) /
+                               CURVE_SCALE) *
+                     sign_i32(raw_delta);
 
     bool reversing = axis->velocity_fp != 0 &&
                      sign_i32(target) != sign_i32(axis->velocity_fp);
@@ -183,6 +196,7 @@ static int32_t animate_axis(struct axis_animation *axis, uint32_t now_ms,
             axis->target_fp = 0;
             axis->last_input_ms = 0;
             axis->coasting = false;
+            axis->stage_initialized = false;
             return 0;
         }
 
@@ -321,6 +335,25 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
         .low_speed_response = DT_INST_PROP(inst, low_speed_response),             \
         .coast_ms = DT_INST_PROP(inst, coast_ms),                                 \
         .release_ms = DT_INST_PROP(inst, release_ms),                             \
+        .stage_thresholds = {                                                     \
+            DT_INST_PROP_BY_IDX(inst, stage_thresholds, 0),                       \
+            DT_INST_PROP_BY_IDX(inst, stage_thresholds, 1),                       \
+            DT_INST_PROP_BY_IDX(inst, stage_thresholds, 2),                       \
+            DT_INST_PROP_BY_IDX(inst, stage_thresholds, 3),                       \
+            DT_INST_PROP_BY_IDX(inst, stage_thresholds, 4),                       \
+            DT_INST_PROP_BY_IDX(inst, stage_thresholds, 5),                       \
+        },                                                                        \
+        .stage_velocities_per_mille = {                                           \
+            DT_INST_PROP_BY_IDX(inst, stage_velocities_per_mille, 0),             \
+            DT_INST_PROP_BY_IDX(inst, stage_velocities_per_mille, 1),             \
+            DT_INST_PROP_BY_IDX(inst, stage_velocities_per_mille, 2),             \
+            DT_INST_PROP_BY_IDX(inst, stage_velocities_per_mille, 3),             \
+            DT_INST_PROP_BY_IDX(inst, stage_velocities_per_mille, 4),             \
+            DT_INST_PROP_BY_IDX(inst, stage_velocities_per_mille, 5),             \
+            DT_INST_PROP_BY_IDX(inst, stage_velocities_per_mille, 6),             \
+        },                                                                        \
+        .stage_hysteresis_per_mille =                                             \
+            DT_INST_PROP(inst, stage_hysteresis_per_mille),                       \
         .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),     \
         .invert_vertical = DT_INST_PROP_OR(inst, invert_vertical, false),         \
     };                                                                            \
