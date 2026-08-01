@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include <zephyr/device.h>
 #include <zephyr/input/input.h>
@@ -13,235 +14,151 @@
 
 LOG_MODULE_REGISTER(zmk_scroll_nurunuru, CONFIG_ZMK_SCROLL_NURUNURU_LOG_LEVEL);
 
-#define FP_SCALE 1024
-#define GAIN_SCALE 1000
-#define REPORT_INTERVAL_MS 8
-#define INPUT_RELEASE_MS 40
-#define MAX_SAMPLE_MS 100
-#define RAW_SCROLL_DIVISOR 24
+#define UPDATE_MS 8
+#define VELOCITY_Q 1024
+#define MAX_EVENTS_PER_TICK 4
+#define MAX_SAMPLE_MS 200
 
 struct scroll_nurunuru_config {
-    uint16_t base_gain;
-    uint16_t max_gain;
-    uint16_t acceleration_start;
-    uint16_t acceleration_end;
-    uint8_t response;
-    uint16_t drag_per_mille;
-    uint16_t stop_threshold;
+    uint16_t scroll_tick;
+    uint8_t sensitivity;
+    uint16_t response_ms;
+    uint16_t bridge_ms;
+    uint16_t release_ms;
     bool invert_horizontal;
     bool invert_vertical;
 };
 
 struct scroll_nurunuru_data {
-    const struct device *dev;
     const struct device *input_device;
+    const struct device *dev;
     struct k_mutex lock;
-    struct k_work_delayable work;
-    bool worker_running;
-    int32_t pending_horizontal;
-    int32_t pending_vertical;
-    int32_t velocity_horizontal_fp;
-    int32_t velocity_vertical_fp;
-    int32_t output_horizontal_fp;
-    int32_t output_vertical_fp;
-    uint32_t last_input_ms;
-    uint32_t last_sample_ms;
+    struct k_work_delayable update_work;
+    int32_t pending_wheel;
+    int32_t pending_hwheel;
+    int32_t target_wheel_q;
+    int32_t target_hwheel_q;
+    int32_t velocity_wheel_q;
+    int32_t velocity_hwheel_q;
+    int64_t phase_wheel_mq;
+    int64_t phase_hwheel_mq;
+    int64_t last_sample_ms;
+    int64_t last_input_ms;
+    int64_t last_update_ms;
+    bool running;
 };
 
-static int32_t abs_i32(int32_t value) {
-    if (value == INT32_MIN) {
-        return INT32_MAX;
-    }
-    return value < 0 ? -value : value;
+static int32_t saturating_add(int32_t a, int32_t b) {
+    return (int32_t)CLAMP((int64_t)a + b, (int64_t)INT32_MIN, (int64_t)INT32_MAX);
 }
 
-static int8_t sign_i32(int32_t value) {
-    return (value > 0) - (value < 0);
-}
-
-static int16_t clamp_i16(int32_t value) {
-    return (int16_t)CLAMP(value, (int32_t)INT16_MIN, (int32_t)INT16_MAX);
-}
-
-/* smoothstep(x) = x*x*(3-2*x), with x in 0..1000. */
-static int32_t smoothstep_per_mille(int32_t x) {
-    x = CLAMP(x, 0, GAIN_SCALE);
-    int64_t x2 = ((int64_t)x * x) / GAIN_SCALE;
-    return (int32_t)((x2 * (3 * GAIN_SCALE - 2 * x)) / GAIN_SCALE);
-}
-
-static int32_t calculate_gain(const struct scroll_nurunuru_config *config,
-                              int32_t speed_counts_per_second) {
-    if (speed_counts_per_second <= config->acceleration_start) {
-        return config->base_gain;
-    }
-    if (speed_counts_per_second >= config->acceleration_end) {
-        return config->max_gain;
-    }
-
-    int32_t range = config->acceleration_end - config->acceleration_start;
-    int32_t position = speed_counts_per_second - config->acceleration_start;
-    int32_t progress = (int32_t)(((int64_t)position * GAIN_SCALE) / range);
-    int32_t curve = smoothstep_per_mille(progress);
-
-    return config->base_gain +
-           (int32_t)(((int64_t)(config->max_gain - config->base_gain) * curve) /
-                     GAIN_SCALE);
-}
-
-/* Convert raw movement collected during dt into wheel units per 8 ms frame. */
-static int32_t calculate_target_velocity_fp(int32_t raw_delta, uint32_t dt_ms,
-                                            int32_t gain_per_mille) {
-    if (raw_delta == 0 || dt_ms == 0) {
+static int32_t rate_from_sample(int32_t delta, int32_t dt_ms,
+                                const struct scroll_nurunuru_config *config) {
+    if (delta == 0 || config->scroll_tick == 0) {
         return 0;
     }
 
-    int64_t target = (int64_t)raw_delta * REPORT_INTERVAL_MS * FP_SCALE;
-    target *= gain_per_mille;
-    target /= (int64_t)dt_ms * RAW_SCROLL_DIVISOR * GAIN_SCALE;
-    return (int32_t)CLAMP(target, (int64_t)INT32_MIN, (int64_t)INT32_MAX);
+    int64_t numerator = (int64_t)delta * 1000 * VELOCITY_Q * config->sensitivity;
+    int64_t denominator = (int64_t)dt_ms * config->scroll_tick * 2;
+    return (int32_t)CLAMP(numerator / denominator, (int64_t)INT32_MIN,
+                          (int64_t)INT32_MAX);
 }
 
-static int32_t smooth_toward(int32_t current, int32_t target, uint8_t response) {
-    response = CLAMP(response, 1, 100);
-    int64_t difference = (int64_t)target - current;
-    return current + (int32_t)((difference * response) / 100);
-}
-
-static int32_t apply_drag(int32_t value, uint16_t drag_per_mille,
-                          uint16_t stop_threshold) {
-    int32_t result = (int32_t)(((int64_t)value * drag_per_mille) / GAIN_SCALE);
-    return abs_i32(result) < stop_threshold ? 0 : result;
-}
-
-static int16_t extract_output(int32_t *accumulator_fp) {
-    int32_t output = *accumulator_fp / FP_SCALE;
-    *accumulator_fp -= output * FP_SCALE;
-    return clamp_i16(output);
-}
-
-static void send_scroll_events(const struct device *input_device, int16_t horizontal,
-                               int16_t vertical) {
-    if (input_device == NULL || (horizontal == 0 && vertical == 0)) {
-        return;
+static int32_t approach(int32_t current, int32_t target, int32_t dt_ms, int32_t time_ms) {
+    if (time_ms <= dt_ms) {
+        return target;
     }
-
-    if (horizontal != 0) {
-        int ret = input_report_rel(input_device, INPUT_REL_HWHEEL, horizontal,
-                                   vertical == 0, K_NO_WAIT);
-        if (ret < 0) {
-            LOG_WRN("Failed horizontal scroll report: %d", ret);
-        }
-    }
-
-    if (vertical != 0) {
-        int ret = input_report_rel(input_device, INPUT_REL_WHEEL, vertical, true, K_NO_WAIT);
-        if (ret < 0) {
-            LOG_WRN("Failed vertical scroll report: %d", ret);
-        }
-    }
+    return current + (int32_t)(((int64_t)(target - current) * dt_ms) / time_ms);
 }
 
-static void update_axis(int32_t frame, int32_t target, int32_t *velocity,
-                        int32_t *output, uint8_t response, uint16_t drag,
-                        uint16_t stop_threshold, bool input_active) {
-    /* The first opposite-direction sample brakes this axis and is absorbed. */
-    if (frame != 0 && *velocity != 0 && sign_i32(frame) != sign_i32(*velocity)) {
-        *velocity = 0;
-        *output = 0;
-        return;
-    }
+static int emit_axis(const struct device *input_device, uint16_t code, int64_t *phase_mq,
+                     bool invert) {
+    const int64_t one_event = (int64_t)1000 * VELOCITY_Q;
+    int emitted = 0;
 
-    if (input_active) {
-        *velocity = smooth_toward(*velocity, target, response);
-    } else {
-        *velocity = apply_drag(*velocity, drag, stop_threshold);
+    while (llabs(*phase_mq) >= one_event && emitted < MAX_EVENTS_PER_TICK) {
+        int direction = *phase_mq > 0 ? 1 : -1;
+        *phase_mq -= direction * one_event;
+        input_report_rel(input_device, code, invert ? -direction : direction, true,
+                         K_MSEC(5));
+        emitted++;
     }
+    return emitted;
 }
 
-static void scroll_nurunuru_work_callback(struct k_work *work) {
-    struct k_work_delayable *delayable = k_work_delayable_from_work(work);
+static void update_work_callback(struct k_work *work) {
     struct scroll_nurunuru_data *data =
-        CONTAINER_OF(delayable, struct scroll_nurunuru_data, work);
+        CONTAINER_OF(k_work_delayable_from_work(work), struct scroll_nurunuru_data,
+                     update_work);
     const struct scroll_nurunuru_config *config = data->dev->config;
-    int16_t output_horizontal;
-    int16_t output_vertical;
-    const struct device *input_device;
 
     k_mutex_lock(&data->lock, K_FOREVER);
+    int64_t now_ms = k_uptime_get();
+    int32_t dt_ms = data->last_update_ms > 0 ? (int32_t)(now_ms - data->last_update_ms)
+                                             : UPDATE_MS;
+    dt_ms = CLAMP(dt_ms, 1, 24);
+    data->last_update_ms = now_ms;
 
-    uint32_t now_ms = k_uptime_get_32();
-    int32_t frame_horizontal = data->pending_horizontal;
-    int32_t frame_vertical = data->pending_vertical;
-    data->pending_horizontal = 0;
-    data->pending_vertical = 0;
+    bool bridging = now_ms - data->last_input_ms <= config->bridge_ms;
+    int32_t target_wheel_q = bridging ? data->target_wheel_q : 0;
+    int32_t target_hwheel_q = bridging ? data->target_hwheel_q : 0;
+    int32_t time_ms = bridging ? config->response_ms : config->release_ms;
 
-    bool input_active = frame_horizontal != 0 || frame_vertical != 0;
-    uint32_t dt_ms = data->last_sample_ms == 0
-                         ? REPORT_INTERVAL_MS
-                         : now_ms - data->last_sample_ms;
-    dt_ms = CLAMP(dt_ms, 1U, (uint32_t)MAX_SAMPLE_MS);
+    data->velocity_wheel_q =
+        approach(data->velocity_wheel_q, target_wheel_q, dt_ms, time_ms);
+    data->velocity_hwheel_q =
+        approach(data->velocity_hwheel_q, target_hwheel_q, dt_ms, time_ms);
+    data->phase_wheel_mq += (int64_t)data->velocity_wheel_q * dt_ms;
+    data->phase_hwheel_mq += (int64_t)data->velocity_hwheel_q * dt_ms;
 
-    if (input_active) {
-        data->last_sample_ms = now_ms;
+    if (data->input_device != NULL) {
+        emit_axis(data->input_device, INPUT_REL_WHEEL, &data->phase_wheel_mq,
+                  config->invert_vertical);
+        emit_axis(data->input_device, INPUT_REL_HWHEEL, &data->phase_hwheel_mq,
+                  config->invert_horizontal);
     }
 
-    int32_t speed = (int32_t)(((int64_t)MAX(abs_i32(frame_horizontal),
-                                                    abs_i32(frame_vertical)) *
-                               1000) /
-                              dt_ms);
-    int32_t gain = calculate_gain(config, speed);
-    int32_t target_horizontal =
-        calculate_target_velocity_fp(frame_horizontal, dt_ms, gain);
-    int32_t target_vertical =
-        calculate_target_velocity_fp(frame_vertical, dt_ms, gain);
-
-    update_axis(frame_horizontal, target_horizontal, &data->velocity_horizontal_fp,
-                &data->output_horizontal_fp, config->response, config->drag_per_mille,
-                config->stop_threshold, input_active);
-    update_axis(frame_vertical, target_vertical, &data->velocity_vertical_fp,
-                &data->output_vertical_fp, config->response, config->drag_per_mille,
-                config->stop_threshold, input_active);
-
-    data->output_horizontal_fp += data->velocity_horizontal_fp;
-    data->output_vertical_fp += data->velocity_vertical_fp;
-    output_horizontal = extract_output(&data->output_horizontal_fp);
-    output_vertical = extract_output(&data->output_vertical_fp);
-
-    if (config->invert_horizontal) {
-        output_horizontal = -output_horizontal;
-    }
-    if (config->invert_vertical) {
-        output_vertical = -output_vertical;
-    }
-
-    bool velocity_active = data->velocity_horizontal_fp != 0 ||
-                           data->velocity_vertical_fp != 0;
-    bool release_pending = (now_ms - data->last_input_ms) < INPUT_RELEASE_MS;
-
-    if (input_active || velocity_active || release_pending) {
-        k_work_reschedule(&data->work, K_MSEC(REPORT_INTERVAL_MS));
+    bool settled = !bridging && abs(data->velocity_wheel_q) < VELOCITY_Q / 32 &&
+                   abs(data->velocity_hwheel_q) < VELOCITY_Q / 32 &&
+                   llabs(data->phase_wheel_mq) < (int64_t)1000 * VELOCITY_Q &&
+                   llabs(data->phase_hwheel_mq) < (int64_t)1000 * VELOCITY_Q;
+    if (settled) {
+        data->velocity_wheel_q = 0;
+        data->velocity_hwheel_q = 0;
+        data->phase_wheel_mq = 0;
+        data->phase_hwheel_mq = 0;
+        data->running = false;
+        data->last_update_ms = 0;
     } else {
-        data->worker_running = false;
-        data->last_sample_ms = 0;
-        data->output_horizontal_fp = 0;
-        data->output_vertical_fp = 0;
+        k_work_reschedule(&data->update_work, K_MSEC(UPDATE_MS));
     }
-
-    input_device = data->input_device;
-    LOG_DBG("raw=(%ld,%ld) dt=%u speed=%ld gain=%ld velocity=(%ld,%ld) output=(%d,%d)",
-            (long)frame_horizontal, (long)frame_vertical, dt_ms, (long)speed,
-            (long)gain, (long)data->velocity_horizontal_fp,
-            (long)data->velocity_vertical_fp, output_horizontal, output_vertical);
-
     k_mutex_unlock(&data->lock);
-    send_scroll_events(input_device, output_horizontal, output_vertical);
+}
+
+static void process_sample(struct scroll_nurunuru_data *data,
+                           const struct scroll_nurunuru_config *config, int64_t now_ms) {
+    int32_t dt_ms = data->last_sample_ms > 0 ? (int32_t)(now_ms - data->last_sample_ms) : 16;
+    dt_ms = CLAMP(dt_ms, 4, MAX_SAMPLE_MS);
+    data->last_sample_ms = now_ms;
+    data->last_input_ms = now_ms;
+
+    data->target_wheel_q = rate_from_sample(data->pending_wheel, dt_ms, config);
+    data->target_hwheel_q = rate_from_sample(data->pending_hwheel, dt_ms, config);
+    data->pending_wheel = 0;
+    data->pending_hwheel = 0;
+
+    if (!data->running && (data->target_wheel_q != 0 || data->target_hwheel_q != 0)) {
+        data->running = true;
+        data->last_update_ms = now_ms;
+        k_work_reschedule(&data->update_work, K_NO_WAIT);
+    }
 }
 
 static int scroll_nurunuru_handle_event(
     const struct device *dev, struct input_event *event, uint32_t param1, uint32_t param2,
     struct zmk_input_processor_state *processor_state) {
     struct scroll_nurunuru_data *data = dev->data;
+    const struct scroll_nurunuru_config *config = dev->config;
     ARG_UNUSED(param1);
     ARG_UNUSED(param2);
     ARG_UNUSED(processor_state);
@@ -251,28 +168,21 @@ static int scroll_nurunuru_handle_event(
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
-    uint16_t original_code = event->code;
-    int32_t original_value = event->value;
-    event->code = original_code == INPUT_REL_X ? INPUT_REL_WHEEL : INPUT_REL_HWHEEL;
+    uint16_t code = event->code;
+    int32_t value = event->value;
+    bool sample_complete = event->sync;
+    event->code = code == INPUT_REL_X ? INPUT_REL_WHEEL : INPUT_REL_HWHEEL;
     event->value = 0;
-
-    if (original_value == 0) {
-        return ZMK_INPUT_PROC_STOP;
-    }
 
     k_mutex_lock(&data->lock, K_FOREVER);
     data->input_device = event->dev;
-    if (original_code == INPUT_REL_X) {
-        data->pending_vertical += original_value;
+    if (code == INPUT_REL_X) {
+        data->pending_wheel = saturating_add(data->pending_wheel, value);
     } else {
-        data->pending_horizontal += original_value;
+        data->pending_hwheel = saturating_add(data->pending_hwheel, value);
     }
-    data->last_input_ms = k_uptime_get_32();
-
-    if (!data->worker_running) {
-        data->worker_running = true;
-        data->last_sample_ms = 0;
-        k_work_reschedule(&data->work, K_MSEC(REPORT_INTERVAL_MS));
+    if (sample_complete) {
+        process_sample(data, config, k_uptime_get());
     }
     k_mutex_unlock(&data->lock);
     return ZMK_INPUT_PROC_STOP;
@@ -282,8 +192,8 @@ static int scroll_nurunuru_init(const struct device *dev) {
     struct scroll_nurunuru_data *data = dev->data;
     data->dev = dev;
     k_mutex_init(&data->lock);
-    k_work_init_delayable(&data->work, scroll_nurunuru_work_callback);
-    LOG_INF("zmk-scroll-nurunuru Mac Mouse Fix style engine initialized");
+    k_work_init_delayable(&data->update_work, update_work_callback);
+    LOG_INF("zmk-scroll-nurunuru 8 ms camera interpolation initialized");
     return 0;
 }
 
@@ -291,23 +201,21 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
     .handle_event = scroll_nurunuru_handle_event,
 };
 
-#define SCROLL_NURUNURU_INST(inst)                                                \
-    static struct scroll_nurunuru_data scroll_nurunuru_data_##inst = {};          \
-    static const struct scroll_nurunuru_config scroll_nurunuru_config_##inst = {  \
-        .base_gain = DT_INST_PROP(inst, base_gain),                               \
-        .max_gain = DT_INST_PROP(inst, max_gain),                                 \
-        .acceleration_start = DT_INST_PROP(inst, acceleration_start),             \
-        .acceleration_end = DT_INST_PROP(inst, acceleration_end),                 \
-        .response = DT_INST_PROP(inst, response),                                 \
-        .drag_per_mille = DT_INST_PROP(inst, drag_per_mille),                     \
-        .stop_threshold = DT_INST_PROP(inst, stop_threshold),                     \
-        .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),     \
-        .invert_vertical = DT_INST_PROP_OR(inst, invert_vertical, false),         \
-    };                                                                            \
-    DEVICE_DT_INST_DEFINE(inst, scroll_nurunuru_init, NULL,                       \
-                          &scroll_nurunuru_data_##inst,                            \
-                          &scroll_nurunuru_config_##inst, POST_KERNEL,             \
-                          CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,                     \
+#define SCROLL_NURUNURU_INST(inst)                                               \
+    static struct scroll_nurunuru_data scroll_nurunuru_data_##inst = {};         \
+    static const struct scroll_nurunuru_config scroll_nurunuru_config_##inst = { \
+        .scroll_tick = DT_INST_PROP(inst, scroll_tick),                          \
+        .sensitivity = DT_INST_PROP(inst, sensitivity),                          \
+        .response_ms = DT_INST_PROP(inst, response_ms),                          \
+        .bridge_ms = DT_INST_PROP(inst, bridge_ms),                              \
+        .release_ms = DT_INST_PROP(inst, release_ms),                            \
+        .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),    \
+        .invert_vertical = DT_INST_PROP_OR(inst, invert_vertical, false),        \
+    };                                                                           \
+    DEVICE_DT_INST_DEFINE(inst, scroll_nurunuru_init, NULL,                      \
+                          &scroll_nurunuru_data_##inst,                           \
+                          &scroll_nurunuru_config_##inst, POST_KERNEL,            \
+                          CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,                    \
                           &scroll_nurunuru_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(SCROLL_NURUNURU_INST)
