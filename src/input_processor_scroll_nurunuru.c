@@ -36,6 +36,7 @@ struct scroll_nurunuru_config {
     uint16_t stage_thresholds[STAGE_THRESHOLD_COUNT];
     uint16_t stage_velocities_per_mille[STAGE_COUNT];
     uint16_t stage_hysteresis_per_mille;
+    uint16_t low_stage_max_gap_ms[3];
     bool invert_horizontal;
     bool invert_vertical;
 };
@@ -49,6 +50,7 @@ struct axis_animation {
     bool coasting;
     uint8_t stage;
     bool stage_initialized;
+    uint32_t last_report_ms;
 };
 
 struct scroll_nurunuru_data {
@@ -160,6 +162,9 @@ static void accept_axis_input(struct axis_animation *axis, int32_t raw_delta, ui
     if (starting) {
         axis->coasting = false;
         axis->target_fp = target;
+        if (axis->last_report_ms == 0) {
+            axis->last_report_ms = now_ms;
+        }
     } else {
         axis->target_fp = smooth_toward(axis->target_fp, target, config->target_response);
     }
@@ -197,6 +202,7 @@ static int32_t animate_axis(struct axis_animation *axis, uint32_t now_ms,
             axis->last_input_ms = 0;
             axis->coasting = false;
             axis->stage_initialized = false;
+            axis->last_report_ms = 0;
             return 0;
         }
 
@@ -215,6 +221,27 @@ static int16_t extract_output(int32_t *accumulator_fp) {
     int32_t output = *accumulator_fp / FP_SCALE;
     *accumulator_fp -= output * FP_SCALE;
     return clamp_i16(output);
+}
+
+/* At stages A-C, trade a small amount of distance accuracy for a bounded visual pause. */
+static int16_t extract_axis_output(struct axis_animation *axis, int32_t *accumulator_fp,
+                                   uint32_t now_ms, bool input_held,
+                                   const struct scroll_nurunuru_config *config) {
+    int16_t output = extract_output(accumulator_fp);
+    if (output != 0) {
+        axis->last_report_ms = now_ms;
+        return output;
+    }
+
+    if (input_held && axis->stage < 3 && axis->velocity_fp != 0 &&
+        now_ms - axis->last_report_ms >= config->low_stage_max_gap_ms[axis->stage]) {
+        /* This is a deliberate predictive step. Discarding the remainder prevents debt
+         * from producing a long compensating pause after the early report. */
+        *accumulator_fp = 0;
+        axis->last_report_ms = now_ms;
+        return sign_i32(axis->velocity_fp);
+    }
+    return 0;
 }
 
 static void send_scroll_events(const struct device *input_device, int16_t horizontal,
@@ -245,10 +272,16 @@ static void scroll_nurunuru_work_callback(struct k_work *work) {
     accept_axis_input(&data->horizontal, frame_horizontal, now_ms, config);
     accept_axis_input(&data->vertical, frame_vertical, now_ms, config);
 
+    bool horizontal_input_held = data->horizontal.last_input_ms != 0 &&
+                                 (now_ms - data->horizontal.last_input_ms) < config->release_ms;
+    bool vertical_input_held = data->vertical.last_input_ms != 0 &&
+                               (now_ms - data->vertical.last_input_ms) < config->release_ms;
     data->output_horizontal_fp += animate_axis(&data->horizontal, now_ms, config);
     data->output_vertical_fp += animate_axis(&data->vertical, now_ms, config);
-    int16_t output_horizontal = extract_output(&data->output_horizontal_fp);
-    int16_t output_vertical = extract_output(&data->output_vertical_fp);
+    int16_t output_horizontal = extract_axis_output(
+        &data->horizontal, &data->output_horizontal_fp, now_ms, horizontal_input_held, config);
+    int16_t output_vertical = extract_axis_output(
+        &data->vertical, &data->output_vertical_fp, now_ms, vertical_input_held, config);
 
     if (config->invert_horizontal) {
         output_horizontal = -output_horizontal;
@@ -354,6 +387,11 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
         },                                                                        \
         .stage_hysteresis_per_mille =                                             \
             DT_INST_PROP(inst, stage_hysteresis_per_mille),                       \
+        .low_stage_max_gap_ms = {                                                 \
+            DT_INST_PROP_BY_IDX(inst, low_stage_max_gap_ms, 0),                   \
+            DT_INST_PROP_BY_IDX(inst, low_stage_max_gap_ms, 1),                   \
+            DT_INST_PROP_BY_IDX(inst, low_stage_max_gap_ms, 2),                   \
+        },                                                                        \
         .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),     \
         .invert_vertical = DT_INST_PROP_OR(inst, invert_vertical, false),         \
     };                                                                            \

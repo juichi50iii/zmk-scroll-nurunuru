@@ -64,6 +64,10 @@ properties:
     type: int
     default: 800
     description: Fraction of each upward boundary used when returning to a slower stage.
+  low-stage-max-gap-ms:
+    type: array
+    required: true
+    description: Maximum time without a report at stages A, B, and C before one predictive step.
   invert-horizontal:
     type: boolean
   invert-vertical:
