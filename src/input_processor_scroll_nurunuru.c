@@ -88,22 +88,6 @@ static int16_t clamp_i16(int32_t value) {
     return (int16_t)CLAMP(value, (int32_t)INT16_MIN, (int32_t)INT16_MAX);
 }
 
-static int32_t smoothstep(int32_t x) {
-    x = CLAMP(x, 0, CURVE_SCALE);
-    int64_t x2 = ((int64_t)x * x) / CURVE_SCALE;
-    return (int32_t)((x2 * (3 * CURVE_SCALE - 2 * x)) / CURVE_SCALE);
-}
-
-/* x^3 * (x * (6x - 15) + 10): zero slope and acceleration at both ends. */
-static int32_t smootherstep(int32_t x) {
-    x = CLAMP(x, 0, CURVE_SCALE);
-    int64_t x2 = ((int64_t)x * x) / CURVE_SCALE;
-    int64_t x3 = (x2 * x) / CURVE_SCALE;
-    int64_t inner = ((6LL * x * x) / CURVE_SCALE) - (15LL * x) +
-                    (10LL * CURVE_SCALE);
-    return (int32_t)((x3 * inner) / CURVE_SCALE);
-}
-
 static int32_t smooth_toward(int32_t current, int32_t target, uint8_t response) {
     response = CLAMP(response, 1, 100);
     return current + (int32_t)(((int64_t)(target - current) * response) / 100);
