@@ -14,21 +14,34 @@
 LOG_MODULE_REGISTER(zmk_scroll_nurunuru, CONFIG_ZMK_SCROLL_NURUNURU_LOG_LEVEL);
 
 #define FP_SCALE 1024
-#define GAIN_SCALE 1000
+#define CURVE_SCALE 1000
 #define REPORT_INTERVAL_MS 8
-#define MAX_SAMPLE_MS 100
+#define MAX_SAMPLE_MS 120
 
 struct scroll_nurunuru_config {
     uint16_t base_gain;
     uint16_t max_gain;
     uint16_t acceleration_start;
     uint16_t acceleration_end;
-    uint8_t queue_response;
-    uint8_t velocity_response;
+    uint8_t target_response;
     uint16_t distance_divisor;
     uint16_t max_velocity;
+    uint16_t ramp_ms;
+    uint16_t coast_ms;
+    uint16_t release_ms;
     bool invert_horizontal;
     bool invert_vertical;
+};
+
+struct axis_animation {
+    int32_t target_fp;
+    int32_t velocity_fp;
+    int32_t ramp_origin_fp;
+    int32_t release_velocity_fp;
+    uint32_t ramp_started_ms;
+    uint32_t coast_started_ms;
+    uint32_t last_input_ms;
+    bool coasting;
 };
 
 struct scroll_nurunuru_data {
@@ -39,13 +52,10 @@ struct scroll_nurunuru_data {
     bool worker_running;
     int32_t pending_horizontal;
     int32_t pending_vertical;
-    int32_t queued_horizontal_fp;
-    int32_t queued_vertical_fp;
-    int32_t velocity_horizontal_fp;
-    int32_t velocity_vertical_fp;
+    struct axis_animation horizontal;
+    struct axis_animation vertical;
     int32_t output_horizontal_fp;
     int32_t output_vertical_fp;
-    uint32_t last_sample_ms;
 };
 
 static int32_t abs_i32(int32_t value) {
@@ -56,14 +66,37 @@ static int8_t sign_i32(int32_t value) {
     return (value > 0) - (value < 0);
 }
 
+static int32_t saturating_add(int32_t a, int32_t b) {
+    return (int32_t)CLAMP((int64_t)a + b, (int64_t)INT32_MIN, (int64_t)INT32_MAX);
+}
+
 static int16_t clamp_i16(int32_t value) {
     return (int16_t)CLAMP(value, (int32_t)INT16_MIN, (int32_t)INT16_MAX);
 }
 
-static int32_t smoothstep_per_mille(int32_t x) {
-    x = CLAMP(x, 0, GAIN_SCALE);
-    int64_t x2 = ((int64_t)x * x) / GAIN_SCALE;
-    return (int32_t)((x2 * (3 * GAIN_SCALE - 2 * x)) / GAIN_SCALE);
+static int32_t smoothstep(int32_t x) {
+    x = CLAMP(x, 0, CURVE_SCALE);
+    int64_t x2 = ((int64_t)x * x) / CURVE_SCALE;
+    return (int32_t)((x2 * (3 * CURVE_SCALE - 2 * x)) / CURVE_SCALE);
+}
+
+/* x^3 * (x * (6x - 15) + 10): zero slope and acceleration at both ends. */
+static int32_t smootherstep(int32_t x) {
+    x = CLAMP(x, 0, CURVE_SCALE);
+    int64_t x2 = ((int64_t)x * x) / CURVE_SCALE;
+    int64_t x3 = (x2 * x) / CURVE_SCALE;
+    int64_t inner = ((6LL * x * x) / CURVE_SCALE) - (15LL * x) +
+                    (10LL * CURVE_SCALE);
+    return (int32_t)((x3 * inner) / CURVE_SCALE);
+}
+
+static int32_t interpolate(int32_t from, int32_t to, int32_t progress) {
+    return from + (int32_t)(((int64_t)(to - from) * progress) / CURVE_SCALE);
+}
+
+static int32_t smooth_toward(int32_t current, int32_t target, uint8_t response) {
+    response = CLAMP(response, 1, 100);
+    return current + (int32_t)(((int64_t)(target - current) * response) / 100);
 }
 
 static int32_t calculate_gain(const struct scroll_nurunuru_config *config, int32_t speed) {
@@ -74,85 +107,102 @@ static int32_t calculate_gain(const struct scroll_nurunuru_config *config, int32
         return config->max_gain;
     }
 
-    int32_t range = config->acceleration_end - config->acceleration_start;
     int32_t progress = (int32_t)(((int64_t)(speed - config->acceleration_start) *
-                                  GAIN_SCALE) /
-                                 range);
-    int32_t curve = smoothstep_per_mille(progress);
+                                  CURVE_SCALE) /
+                                 (config->acceleration_end - config->acceleration_start));
+    int32_t curve = smoothstep(progress);
     return config->base_gain +
            (int32_t)(((int64_t)(config->max_gain - config->base_gain) * curve) /
-                     GAIN_SCALE);
+                     CURVE_SCALE);
 }
 
-static int32_t calculate_distance_fp(int32_t raw_delta, int32_t gain,
-                                     uint16_t distance_divisor) {
-    int64_t distance = (int64_t)raw_delta * gain * FP_SCALE;
-    distance /= (int64_t)GAIN_SCALE * MAX(distance_divisor, 1);
-    return (int32_t)CLAMP(distance, (int64_t)INT32_MIN, (int64_t)INT32_MAX);
+static int32_t calculate_target_fp(int32_t raw_delta, uint32_t dt_ms, int32_t gain,
+                                   const struct scroll_nurunuru_config *config) {
+    int64_t target = (int64_t)raw_delta * REPORT_INTERVAL_MS * FP_SCALE * gain;
+    target /= (int64_t)MAX(dt_ms, 1U) * CURVE_SCALE *
+              MAX(config->distance_divisor, 1);
+    int32_t maximum = (int32_t)config->max_velocity * FP_SCALE;
+    return (int32_t)CLAMP(target, -(int64_t)maximum, (int64_t)maximum);
 }
 
-static int32_t saturating_add(int32_t a, int32_t b) {
-    return (int32_t)CLAMP((int64_t)a + b, (int64_t)INT32_MIN, (int64_t)INT32_MAX);
-}
-
-static int32_t smooth_toward(int32_t current, int32_t target, uint8_t response) {
-    response = CLAMP(response, 1, 100);
-    int64_t difference = (int64_t)target - current;
-    return current + (int32_t)((difference * response) / 100);
-}
-
-static void add_distance(int32_t raw_delta, int32_t distance_fp, int32_t *queue_fp,
-                         int32_t *velocity_fp, int32_t *output_fp) {
+static void accept_axis_input(struct axis_animation *axis, int32_t raw_delta, uint32_t now_ms,
+                              const struct scroll_nurunuru_config *config) {
     if (raw_delta == 0) {
         return;
     }
 
-    /* A direction change cancels the old animation before starting the new one. */
-    if ((*queue_fp != 0 && sign_i32(raw_delta) != sign_i32(*queue_fp)) ||
-        (*velocity_fp != 0 && sign_i32(raw_delta) != sign_i32(*velocity_fp))) {
-        *queue_fp = 0;
-        *velocity_fp = 0;
-        *output_fp = 0;
+    uint32_t dt_ms = axis->last_input_ms == 0 ? REPORT_INTERVAL_MS
+                                               : now_ms - axis->last_input_ms;
+    dt_ms = CLAMP(dt_ms, 1U, (uint32_t)MAX_SAMPLE_MS);
+    int32_t speed = (int32_t)(((int64_t)abs_i32(raw_delta) * 1000) / dt_ms);
+    int32_t target = calculate_target_fp(raw_delta, dt_ms, calculate_gain(config, speed), config);
+
+    bool reversing = axis->velocity_fp != 0 &&
+                     sign_i32(target) != sign_i32(axis->velocity_fp);
+    bool starting = axis->last_input_ms == 0 || axis->coasting ||
+                    (now_ms - axis->last_input_ms) >= config->release_ms;
+
+    if (reversing) {
+        axis->velocity_fp = 0;
+        axis->target_fp = 0;
+        starting = true;
     }
 
-    *queue_fp = saturating_add(*queue_fp, distance_fp);
-}
-
-/*
- * Drain a finite distance queue with a bounded ease-out animation.
- * New input extends the queue without resetting the current velocity.
- */
-static int32_t animate_axis(int32_t *queue_fp, int32_t *velocity_fp,
-                            const struct scroll_nurunuru_config *config) {
-    if (*queue_fp == 0) {
-        *velocity_fp = 0;
-        return 0;
-    }
-
-    int32_t desired =
-        (int32_t)(((int64_t)*queue_fp * config->queue_response) / 100);
-    int32_t maximum = (int32_t)config->max_velocity * FP_SCALE;
-    desired = CLAMP(desired, -maximum, maximum);
-
-    *velocity_fp = smooth_toward(*velocity_fp, desired, config->velocity_response);
-
-    /* Ensure a tiny queued remainder always makes progress. */
-    if (*velocity_fp == 0) {
-        *velocity_fp = sign_i32(*queue_fp);
-    }
-
-    int32_t step = *velocity_fp;
-    if (sign_i32(step) != sign_i32(*queue_fp) || abs_i32(step) >= abs_i32(*queue_fp)) {
-        step = *queue_fp;
-        *queue_fp = 0;
-        *velocity_fp = 0;
+    if (starting) {
+        axis->ramp_origin_fp = axis->velocity_fp;
+        axis->ramp_started_ms = now_ms;
+        axis->coasting = false;
+        axis->target_fp = target;
     } else {
-        *queue_fp -= step;
+        axis->target_fp = smooth_toward(axis->target_fp, target, config->target_response);
     }
 
-    return step;
+    axis->last_input_ms = now_ms;
 }
 
+static int32_t animate_axis(struct axis_animation *axis, uint32_t now_ms,
+                            const struct scroll_nurunuru_config *config) {
+    bool input_held = axis->last_input_ms != 0 &&
+                      (now_ms - axis->last_input_ms) < config->release_ms;
+
+    if (input_held) {
+        uint32_t elapsed = now_ms - axis->ramp_started_ms;
+        int32_t progress = config->ramp_ms == 0
+                               ? CURVE_SCALE
+                               : (int32_t)MIN((elapsed * CURVE_SCALE) / config->ramp_ms,
+                                              (uint32_t)CURVE_SCALE);
+        axis->velocity_fp = interpolate(axis->ramp_origin_fp, axis->target_fp,
+                                        smootherstep(progress));
+        return axis->velocity_fp;
+    }
+
+    if (!axis->coasting && axis->velocity_fp != 0) {
+        axis->coasting = true;
+        axis->coast_started_ms = now_ms;
+        axis->release_velocity_fp = axis->velocity_fp;
+    }
+
+    if (axis->coasting) {
+        uint32_t elapsed = now_ms - axis->coast_started_ms;
+        if (config->coast_ms == 0 || elapsed >= config->coast_ms) {
+            axis->velocity_fp = 0;
+            axis->target_fp = 0;
+            axis->last_input_ms = 0;
+            axis->coasting = false;
+            return 0;
+        }
+
+        int32_t progress = (int32_t)((elapsed * CURVE_SCALE) / config->coast_ms);
+        axis->velocity_fp = (int32_t)(((int64_t)axis->release_velocity_fp *
+                                       (CURVE_SCALE - smootherstep(progress))) /
+                                      CURVE_SCALE);
+        return axis->velocity_fp;
+    }
+
+    return 0;
+}
+
+/* Fixed-point error diffusion distributes unavoidable 1/16-notch reports evenly. */
 static int16_t extract_output(int32_t *accumulator_fp) {
     int32_t output = *accumulator_fp / FP_SCALE;
     *accumulator_fp -= output * FP_SCALE;
@@ -164,61 +214,31 @@ static void send_scroll_events(const struct device *input_device, int16_t horizo
     if (input_device == NULL || (horizontal == 0 && vertical == 0)) {
         return;
     }
-
     if (horizontal != 0) {
-        int ret = input_report_rel(input_device, INPUT_REL_HWHEEL, horizontal,
-                                   vertical == 0, K_NO_WAIT);
-        if (ret < 0) {
-            LOG_WRN("Failed horizontal scroll report: %d", ret);
-        }
+        input_report_rel(input_device, INPUT_REL_HWHEEL, horizontal, vertical == 0, K_NO_WAIT);
     }
     if (vertical != 0) {
-        int ret = input_report_rel(input_device, INPUT_REL_WHEEL, vertical, true, K_NO_WAIT);
-        if (ret < 0) {
-            LOG_WRN("Failed vertical scroll report: %d", ret);
-        }
+        input_report_rel(input_device, INPUT_REL_WHEEL, vertical, true, K_NO_WAIT);
     }
 }
 
 static void scroll_nurunuru_work_callback(struct k_work *work) {
-    struct k_work_delayable *delayable = k_work_delayable_from_work(work);
     struct scroll_nurunuru_data *data =
-        CONTAINER_OF(delayable, struct scroll_nurunuru_data, work);
+        CONTAINER_OF(k_work_delayable_from_work(work), struct scroll_nurunuru_data, work);
     const struct scroll_nurunuru_config *config = data->dev->config;
 
     k_mutex_lock(&data->lock, K_FOREVER);
-
     uint32_t now_ms = k_uptime_get_32();
-    uint32_t dt_ms = data->last_sample_ms == 0 ? REPORT_INTERVAL_MS
-                                               : now_ms - data->last_sample_ms;
-    dt_ms = CLAMP(dt_ms, 1U, (uint32_t)MAX_SAMPLE_MS);
-    data->last_sample_ms = now_ms;
-
     int32_t frame_horizontal = data->pending_horizontal;
     int32_t frame_vertical = data->pending_vertical;
     data->pending_horizontal = 0;
     data->pending_vertical = 0;
 
-    int32_t speed = (int32_t)(((int64_t)MAX(abs_i32(frame_horizontal),
-                                                    abs_i32(frame_vertical)) *
-                               1000) /
-                              dt_ms);
-    int32_t gain = calculate_gain(config, speed);
+    accept_axis_input(&data->horizontal, frame_horizontal, now_ms, config);
+    accept_axis_input(&data->vertical, frame_vertical, now_ms, config);
 
-    add_distance(frame_horizontal,
-                 calculate_distance_fp(frame_horizontal, gain, config->distance_divisor),
-                 &data->queued_horizontal_fp, &data->velocity_horizontal_fp,
-                 &data->output_horizontal_fp);
-    add_distance(frame_vertical,
-                 calculate_distance_fp(frame_vertical, gain, config->distance_divisor),
-                 &data->queued_vertical_fp, &data->velocity_vertical_fp,
-                 &data->output_vertical_fp);
-
-    data->output_horizontal_fp +=
-        animate_axis(&data->queued_horizontal_fp, &data->velocity_horizontal_fp, config);
-    data->output_vertical_fp +=
-        animate_axis(&data->queued_vertical_fp, &data->velocity_vertical_fp, config);
-
+    data->output_horizontal_fp += animate_axis(&data->horizontal, now_ms, config);
+    data->output_vertical_fp += animate_axis(&data->vertical, now_ms, config);
     int16_t output_horizontal = extract_output(&data->output_horizontal_fp);
     int16_t output_vertical = extract_output(&data->output_vertical_fp);
 
@@ -229,26 +249,15 @@ static void scroll_nurunuru_work_callback(struct k_work *work) {
         output_vertical = -output_vertical;
     }
 
-    bool continue_running = data->pending_horizontal != 0 || data->pending_vertical != 0 ||
-                            data->queued_horizontal_fp != 0 ||
-                            data->queued_vertical_fp != 0 ||
-                            data->velocity_horizontal_fp != 0 ||
-                            data->velocity_vertical_fp != 0;
-
-    if (continue_running) {
+    bool active = data->horizontal.last_input_ms != 0 || data->vertical.last_input_ms != 0 ||
+                  data->horizontal.coasting || data->vertical.coasting;
+    if (active) {
         k_work_reschedule(&data->work, K_MSEC(REPORT_INTERVAL_MS));
     } else {
         data->worker_running = false;
-        data->last_sample_ms = 0;
     }
 
     const struct device *input_device = data->input_device;
-    LOG_DBG("raw=(%ld,%ld) speed=%ld gain=%ld queue=(%ld,%ld) velocity=(%ld,%ld) output=(%d,%d)",
-            (long)frame_horizontal, (long)frame_vertical, (long)speed, (long)gain,
-            (long)data->queued_horizontal_fp, (long)data->queued_vertical_fp,
-            (long)data->velocity_horizontal_fp, (long)data->velocity_vertical_fp,
-            output_horizontal, output_vertical);
-
     k_mutex_unlock(&data->lock);
     send_scroll_events(input_device, output_horizontal, output_vertical);
 }
@@ -270,7 +279,6 @@ static int scroll_nurunuru_handle_event(
     int32_t original_value = event->value;
     event->code = original_code == INPUT_REL_X ? INPUT_REL_WHEEL : INPUT_REL_HWHEEL;
     event->value = 0;
-
     if (original_value == 0) {
         return ZMK_INPUT_PROC_STOP;
     }
@@ -282,10 +290,8 @@ static int scroll_nurunuru_handle_event(
     } else {
         data->pending_horizontal = saturating_add(data->pending_horizontal, original_value);
     }
-
     if (!data->worker_running) {
         data->worker_running = true;
-        data->last_sample_ms = 0;
         k_work_reschedule(&data->work, K_MSEC(REPORT_INTERVAL_MS));
     }
     k_mutex_unlock(&data->lock);
@@ -297,7 +303,7 @@ static int scroll_nurunuru_init(const struct device *dev) {
     data->dev = dev;
     k_mutex_init(&data->lock);
     k_work_init_delayable(&data->work, scroll_nurunuru_work_callback);
-    LOG_INF("zmk-scroll-nurunuru queued easing engine initialized");
+    LOG_INF("zmk-scroll-nurunuru time-curve animator initialized");
     return 0;
 }
 
@@ -312,10 +318,12 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
         .max_gain = DT_INST_PROP(inst, max_gain),                                 \
         .acceleration_start = DT_INST_PROP(inst, acceleration_start),             \
         .acceleration_end = DT_INST_PROP(inst, acceleration_end),                 \
-        .queue_response = DT_INST_PROP(inst, response),                           \
-        .velocity_response = DT_INST_PROP(inst, input_filter_response),           \
+        .target_response = DT_INST_PROP(inst, target_response),                   \
         .distance_divisor = DT_INST_PROP(inst, distance_divisor),                 \
         .max_velocity = DT_INST_PROP(inst, max_velocity),                         \
+        .ramp_ms = DT_INST_PROP(inst, ramp_ms),                                   \
+        .coast_ms = DT_INST_PROP(inst, coast_ms),                                 \
+        .release_ms = DT_INST_PROP(inst, release_ms),                             \
         .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),     \
         .invert_vertical = DT_INST_PROP_OR(inst, invert_vertical, false),         \
     };                                                                            \

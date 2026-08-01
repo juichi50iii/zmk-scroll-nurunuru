@@ -1,7 +1,5 @@
-description: Queued easing inertial scrolling input processor
-
+description: Time-curve animated high-resolution scrolling input processor
 compatible: "zmk,input-processor-scroll-nurunuru"
-
 include: base.yaml
 
 properties:
@@ -9,52 +7,44 @@ properties:
     type: int
     required: true
     const: 0
-
   track-remainders:
     type: boolean
-
   base-gain:
     type: int
-    default: 800
-    description: Low-speed distance gain in per-mille units.
-
+    default: 400
   max-gain:
     type: int
-    default: 1200
-    description: High-speed distance gain in per-mille units.
-
+    default: 800
   acceleration-start:
     type: int
-    default: 350
-    description: Raw counts per second where distance acceleration begins.
-
+    default: 600
   acceleration-end:
     type: int
-    default: 1500
-    description: Raw counts per second where maximum distance gain is reached.
-
-  response:
+    default: 2200
+  target-response:
     type: int
-    default: 18
-    description: Percentage of queued distance requested per 8 ms animation frame.
-
-  input-filter-response:
-    type: int
-    default: 25
-    description: Percentage of target animation velocity adopted per frame.
-
+    default: 30
+    description: Percentage used to stabilize successive measured target speeds.
   distance-divisor:
     type: int
     default: 2
-    description: Divides input distance after gain; higher values scroll less.
-
   max-velocity:
     type: int
-    default: 3
-    description: Maximum high-resolution wheel units emitted per 8 ms frame.
-
+    default: 2
+    description: Maximum high-resolution wheel units per 8 ms frame.
+  ramp-ms:
+    type: int
+    default: 280
+    description: Duration of the zero-slope smootherstep acceleration curve.
+  coast-ms:
+    type: int
+    default: 520
+    description: Duration of the zero-slope smootherstep release curve.
+  release-ms:
+    type: int
+    default: 48
+    description: Sensor gap tolerated before beginning the release curve.
   invert-horizontal:
     type: boolean
-
   invert-vertical:
     type: boolean
