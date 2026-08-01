@@ -1,4 +1,4 @@
-description: Smooth force-based inertial scrolling input processor
+description: Time-based accelerated inertial scrolling input processor
 
 compatible: "zmk,input-processor-scroll-nurunuru"
 
@@ -14,30 +14,40 @@ properties:
     type: boolean
     description: Required by the ZMK input listener remainder tracker.
 
-  scroll-scale:
+  base-gain:
     type: int
-    default: 7
-    description: Scroll fineness from 1 to 10. Higher is finer and slower.
+    default: 700
+    description: Low-speed gain in per-mille units.
 
-  acceleration:
+  max-gain:
     type: int
-    default: 10
-    description: Input acceleration strength from 1 to 10.
+    default: 4500
+    description: High-speed gain in per-mille units.
 
-  hover:
+  acceleration-start:
     type: int
-    default: 4
-    description: Initial low-speed push from 1 to 10.
+    default: 40
+    description: Raw counts per second where acceleration begins.
 
-  inertia:
+  acceleration-end:
     type: int
-    default: 8
-    description: Motion retention from 1 to 10. Higher glides longer.
+    default: 600
+    description: Raw counts per second where maximum gain is reached.
 
-  brake:
+  response:
     type: int
-    default: 3
-    description: Low-speed braking from 1 to 10. Higher stops more strongly.
+    default: 30
+    description: Percentage of target velocity adopted per 8 ms frame (1-100).
+
+  drag-per-mille:
+    type: int
+    default: 940
+    description: Velocity retained per 8 ms frame after input stops (0-999).
+
+  stop-threshold:
+    type: int
+    default: 150
+    description: Fixed-point velocity below which inertia stops.
 
   invert-horizontal:
     type: boolean
