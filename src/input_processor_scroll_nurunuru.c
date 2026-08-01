@@ -104,7 +104,7 @@ static int32_t calculate_gain(const struct scroll_nurunuru_config *config, int32
     int32_t progress = (int32_t)(((int64_t)(speed - config->acceleration_start) *
                                   CURVE_SCALE) /
                                  (config->acceleration_end - config->acceleration_start));
-    int32_t curve = smoothstep(progress);
+    int32_t curve = smootherstep(progress);
     return config->base_gain +
            (int32_t)(((int64_t)(config->max_gain - config->base_gain) * curve) /
                      CURVE_SCALE);
