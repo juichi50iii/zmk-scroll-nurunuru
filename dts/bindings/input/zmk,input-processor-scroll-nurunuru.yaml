@@ -32,10 +32,18 @@ properties:
     type: int
     default: 2
     description: Maximum high-resolution wheel units per 8 ms frame.
-  ramp-ms:
+  rolling-ramp-ms:
+    type: int
+    default: 1000
+    description: Smootherstep acceleration duration for low-speed rolling.
+  flick-ramp-ms:
     type: int
     default: 280
-    description: Duration of the zero-slope smootherstep acceleration curve.
+    description: Smootherstep acceleration duration for a high-speed flick.
+  flick-speed-threshold:
+    type: int
+    default: 1200
+    description: Raw counts per second that select the flick acceleration curve.
   coast-ms:
     type: int
     default: 520

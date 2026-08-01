@@ -26,7 +26,9 @@ struct scroll_nurunuru_config {
     uint8_t target_response;
     uint16_t distance_divisor;
     uint16_t max_velocity;
-    uint16_t ramp_ms;
+    uint16_t rolling_ramp_ms;
+    uint16_t flick_ramp_ms;
+    uint16_t flick_speed_threshold;
     uint16_t coast_ms;
     uint16_t release_ms;
     bool invert_horizontal;
@@ -41,6 +43,7 @@ struct axis_animation {
     uint32_t ramp_started_ms;
     uint32_t coast_started_ms;
     uint32_t last_input_ms;
+    uint16_t ramp_duration_ms;
     bool coasting;
 };
 
@@ -151,6 +154,9 @@ static void accept_axis_input(struct axis_animation *axis, int32_t raw_delta, ui
     if (starting) {
         axis->ramp_origin_fp = axis->velocity_fp;
         axis->ramp_started_ms = now_ms;
+        axis->ramp_duration_ms =
+            speed >= config->flick_speed_threshold ? config->flick_ramp_ms
+                                                    : config->rolling_ramp_ms;
         axis->coasting = false;
         axis->target_fp = target;
     } else {
@@ -167,9 +173,10 @@ static int32_t animate_axis(struct axis_animation *axis, uint32_t now_ms,
 
     if (input_held) {
         uint32_t elapsed = now_ms - axis->ramp_started_ms;
-        int32_t progress = config->ramp_ms == 0
+        int32_t progress = axis->ramp_duration_ms == 0
                                ? CURVE_SCALE
-                               : (int32_t)MIN((elapsed * CURVE_SCALE) / config->ramp_ms,
+                               : (int32_t)MIN((elapsed * CURVE_SCALE) /
+                                                  axis->ramp_duration_ms,
                                               (uint32_t)CURVE_SCALE);
         axis->velocity_fp = interpolate(axis->ramp_origin_fp, axis->target_fp,
                                         smootherstep(progress));
@@ -321,7 +328,9 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
         .target_response = DT_INST_PROP(inst, target_response),                   \
         .distance_divisor = DT_INST_PROP(inst, distance_divisor),                 \
         .max_velocity = DT_INST_PROP(inst, max_velocity),                         \
-        .ramp_ms = DT_INST_PROP(inst, ramp_ms),                                   \
+        .rolling_ramp_ms = DT_INST_PROP(inst, rolling_ramp_ms),                   \
+        .flick_ramp_ms = DT_INST_PROP(inst, flick_ramp_ms),                       \
+        .flick_speed_threshold = DT_INST_PROP(inst, flick_speed_threshold),       \
         .coast_ms = DT_INST_PROP(inst, coast_ms),                                 \
         .release_ms = DT_INST_PROP(inst, release_ms),                             \
         .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),     \
