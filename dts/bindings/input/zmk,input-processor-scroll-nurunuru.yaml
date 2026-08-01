@@ -1,4 +1,4 @@
-description: Experimental virtual two-finger touchpad input processor
+description: Time-interpolated high-resolution inertial scrolling input processor
 compatible: "zmk,input-processor-scroll-nurunuru"
 include: base.yaml
 
@@ -9,10 +9,26 @@ properties:
     const: 0
   track-remainders:
     type: boolean
-  touch-scale:
+  scroll-tick:
     type: int
-    default: 12
-    description: Absolute touchpad coordinate movement per raw sensor count.
+    default: 20
+    description: Raw sensor counts per one high-resolution HID wheel unit.
+  sensitivity:
+    type: int
+    default: 2
+    description: Linear speed multiplier where 2 means 1.0x.
+  response-ms:
+    type: int
+    default: 48
+    description: Time for camera velocity to approach the measured ball velocity.
+  bridge-ms:
+    type: int
+    default: 56
+    description: Time to preserve velocity between sparse low-speed samples.
+  release-ms:
+    type: int
+    default: 160
+    description: Time constant for the gentle stop after input ends.
   invert-horizontal:
     type: boolean
   invert-vertical:
