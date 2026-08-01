@@ -65,78 +65,6 @@ LOG_MODULE_REGISTER(
 #define NURUNURU_ROLL_SESSION_TIMEOUT_MS 200
 #define NURUNURU_ROLL_SESSION_REQUIRED_PULSES 3
 
-static void update_rolling_session(
-    struct scroll_nurunuru_data *data,
-    int32_t frame_horizontal,
-    int32_t frame_vertical,
-    int32_t speed,
-    uint32_t now_ms
-) {
-    if (speed <= 0 || speed > NURUNURU_ROLL_MAX_SPEED) {
-        data->rolling_session_pulses = 0;
-        data->rolling_session_horizontal_direction = 0;
-        data->rolling_session_vertical_direction = 0;
-        return;
-    }
-
-    int8_t horizontal_direction =
-        sign_i32(frame_horizontal);
-
-    int8_t vertical_direction =
-        sign_i32(frame_vertical);
-
-    bool session_expired =
-        (
-            now_ms -
-            data->rolling_session_last_pulse_ms
-        ) > NURUNURU_ROLL_SESSION_TIMEOUT_MS;
-
-    bool horizontal_changed =
-        horizontal_direction != 0 &&
-        data->rolling_session_horizontal_direction != 0 &&
-        horizontal_direction !=
-            data->rolling_session_horizontal_direction;
-
-    bool vertical_changed =
-        vertical_direction != 0 &&
-        data->rolling_session_vertical_direction != 0 &&
-        vertical_direction !=
-            data->rolling_session_vertical_direction;
-
-    if (
-        session_expired ||
-        horizontal_changed ||
-        vertical_changed
-    ) {
-        data->rolling_session_pulses = 0;
-    }
-
-    if (horizontal_direction != 0) {
-        data->rolling_session_horizontal_direction =
-            horizontal_direction;
-    }
-
-    if (vertical_direction != 0) {
-        data->rolling_session_vertical_direction =
-            vertical_direction;
-    }
-
-    data->rolling_session_last_pulse_ms = now_ms;
-
-    if (data->rolling_session_pulses < UINT8_MAX) {
-        data->rolling_session_pulses++;
-    }
-}
-
-static bool rolling_session_is_ready(
-    const struct scroll_nurunuru_data *data,
-    int32_t peak_speed
-) {
-    return data->rolling_session_pulses >=
-               NURUNURU_ROLL_SESSION_REQUIRED_PULSES &&
-           peak_speed <= NURUNURU_ROLL_MAX_PEAK_SPEED;
-}
-
 /* -------------------------------------------------------------------------- */
 /* ROLLING engine                                                             */
 /* -------------------------------------------------------------------------- */
@@ -275,6 +203,79 @@ struct scroll_nurunuru_data {
     bool input_was_active;
     uint32_t last_input_ms;
 };
+
+static void update_rolling_session(
+    struct scroll_nurunuru_data *data,
+    int32_t frame_horizontal,
+    int32_t frame_vertical,
+    int32_t speed,
+    uint32_t now_ms
+) {
+    if (speed <= 0 || speed > NURUNURU_ROLL_MAX_SPEED) {
+        data->rolling_session_pulses = 0;
+        data->rolling_session_horizontal_direction = 0;
+        data->rolling_session_vertical_direction = 0;
+        return;
+    }
+
+    int8_t horizontal_direction =
+        sign_i32(frame_horizontal);
+
+    int8_t vertical_direction =
+        sign_i32(frame_vertical);
+
+    bool session_expired =
+        (
+            now_ms -
+            data->rolling_session_last_pulse_ms
+        ) > NURUNURU_ROLL_SESSION_TIMEOUT_MS;
+
+    bool horizontal_changed =
+        horizontal_direction != 0 &&
+        data->rolling_session_horizontal_direction != 0 &&
+        horizontal_direction !=
+            data->rolling_session_horizontal_direction;
+
+    bool vertical_changed =
+        vertical_direction != 0 &&
+        data->rolling_session_vertical_direction != 0 &&
+        vertical_direction !=
+            data->rolling_session_vertical_direction;
+
+    if (
+        session_expired ||
+        horizontal_changed ||
+        vertical_changed
+    ) {
+        data->rolling_session_pulses = 0;
+    }
+
+    if (horizontal_direction != 0) {
+        data->rolling_session_horizontal_direction =
+            horizontal_direction;
+    }
+
+    if (vertical_direction != 0) {
+        data->rolling_session_vertical_direction =
+            vertical_direction;
+    }
+
+    data->rolling_session_last_pulse_ms = now_ms;
+
+    if (data->rolling_session_pulses < UINT8_MAX) {
+        data->rolling_session_pulses++;
+    }
+}
+
+static bool rolling_session_is_ready(
+    const struct scroll_nurunuru_data *data,
+    int32_t peak_speed
+) {
+    return data->rolling_session_pulses >=
+               NURUNURU_ROLL_SESSION_REQUIRED_PULSES &&
+           peak_speed <= NURUNURU_ROLL_MAX_PEAK_SPEED;
+}
+
 
 /* -------------------------------------------------------------------------- */
 /* Basic helpers                                                              */
