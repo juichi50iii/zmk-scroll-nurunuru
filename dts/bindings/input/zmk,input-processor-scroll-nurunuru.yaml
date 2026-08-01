@@ -36,10 +36,6 @@ properties:
     type: int
     default: 2000
     description: Maximum high-resolution wheel units per 8 ms frame, in thousandths.
-  coast-velocity-per-mille:
-    type: int
-    default: 400
-    description: Fraction of the live velocity retained when a flick begins.
   low-speed-response:
     type: int
     default: 60
@@ -52,6 +48,22 @@ properties:
     type: int
     default: 48
     description: Sensor gap tolerated before beginning the release curve.
+  rolling-friction:
+    type: int
+    default: 5000
+    description: Constant virtual friction force applied every 8 ms frame.
+  quadratic-drag:
+    type: int
+    default: 150
+    description: High-speed resistance proportional to velocity squared.
+  static-velocity:
+    type: int
+    default: 2
+    description: Fixed-point velocity below which static friction stops motion.
+  max-coast-ms:
+    type: int
+    default: 5000
+    description: Safety limit for a single physical coast.
   stage-thresholds:
     type: array
     required: true
@@ -68,10 +80,10 @@ properties:
     type: array
     required: true
     description: Maximum time without a report at stages A, B, and C before one predictive step.
-  stage-coast-ms:
+  stage-mass-per-mille:
     type: array
     required: true
-    description: Seven stage-specific coast durations; zero disables coasting for that stage.
+    description: Seven virtual masses; zero disables coasting for that stage.
   invert-horizontal:
     type: boolean
   invert-vertical:
