@@ -1525,6 +1525,15 @@ static void scroll_nurunuru_work_callback(
             );
     }
 
+    /*
+    * Common final screen scale.
+    *
+    * Preserve the relationship between ROLLING and FLICK,
+    * while reducing the whole engine output to one half.
+    */
+    scaled_horizontal_fp /= 2;
+    scaled_vertical_fp /= 2;
+
     data->output_horizontal_fp +=
         scaled_horizontal_fp;
 
