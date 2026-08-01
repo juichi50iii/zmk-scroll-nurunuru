@@ -1,7 +1,5 @@
-description: Time-based accelerated inertial scrolling input processor
-
+description: Time-curve animated high-resolution scrolling input processor
 compatible: "zmk,input-processor-scroll-nurunuru"
-
 include: base.yaml
 
 properties:
@@ -9,48 +7,84 @@ properties:
     type: int
     required: true
     const: 0
-
   track-remainders:
     type: boolean
-    description: Required by the ZMK input listener remainder tracker.
-
   base-gain:
     type: int
-    default: 700
-    description: Low-speed gain in per-mille units.
-
+    default: 400
   max-gain:
     type: int
-    default: 4500
-    description: High-speed gain in per-mille units.
-
+    default: 800
   acceleration-start:
     type: int
-    default: 40
-    description: Raw counts per second where acceleration begins.
-
+    default: 600
   acceleration-end:
     type: int
-    default: 600
-    description: Raw counts per second where maximum gain is reached.
-
-  response:
+    default: 2200
+  target-response:
     type: int
     default: 30
-    description: Percentage of target velocity adopted per 8 ms frame (1-100).
-
-  drag-per-mille:
+    description: Percentage used to stabilize successive measured target speeds.
+  velocity-response:
     type: int
-    default: 940
-    description: Velocity retained per 8 ms frame after input stops (0-999).
-
-  stop-threshold:
+    default: 25
+    description: Percentage of target camera velocity adopted per 8 ms frame.
+  distance-divisor:
+    type: int
+    default: 2
+  max-velocity-per-mille:
+    type: int
+    default: 2000
+    description: Maximum high-resolution wheel units per 8 ms frame, in thousandths.
+  low-speed-response:
+    type: int
+    default: 60
+    description: Percentage of target velocity adopted per frame below 0.25 units.
+  launch-ms:
+    type: int
+    default: 96
+    description: Time spent in stage A before stage B becomes the minimum live speed.
+  release-ms:
+    type: int
+    default: 48
+    description: Sensor gap tolerated before beginning the release curve.
+  rolling-friction:
+    type: int
+    default: 5000
+    description: Constant virtual friction force applied every 8 ms frame.
+  quadratic-drag:
     type: int
     default: 150
-    description: Fixed-point velocity below which inertia stops.
-
+    description: High-speed resistance proportional to velocity squared.
+  static-velocity:
+    type: int
+    default: 2
+    description: Fixed-point velocity below which static friction stops motion.
+  max-coast-ms:
+    type: int
+    default: 5000
+    description: Safety limit for a single physical coast.
+  stage-thresholds:
+    type: array
+    required: true
+    description: Six ascending ball-speed boundaries selecting stages A through G.
+  stage-velocities-per-mille:
+    type: array
+    required: true
+    description: Seven S-curve camera velocities in thousandths of a wheel unit per frame.
+  stage-hysteresis-per-mille:
+    type: int
+    default: 800
+    description: Fraction of each upward boundary used when returning to a slower stage.
+  low-stage-max-gap-ms:
+    type: array
+    required: true
+    description: Maximum time without a report at stages A, B, and C before one predictive step.
+  stage-mass-per-mille:
+    type: array
+    required: true
+    description: Seven virtual masses; zero disables coasting for that stage.
   invert-horizontal:
     type: boolean
-
   invert-vertical:
     type: boolean
