@@ -204,6 +204,8 @@ struct scroll_nurunuru_data {
     uint32_t last_input_ms;
 };
 
+static int8_t sign_i32(int32_t value);
+
 static void update_rolling_session(
     struct scroll_nurunuru_data *data,
     int32_t frame_horizontal,
