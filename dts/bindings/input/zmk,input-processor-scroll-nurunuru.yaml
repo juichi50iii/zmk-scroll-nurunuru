@@ -1,4 +1,4 @@
-description: Time-based accelerated inertial scrolling input processor
+description: Queued easing inertial scrolling input processor
 
 compatible: "zmk,input-processor-scroll-nurunuru"
 
@@ -12,52 +12,46 @@ properties:
 
   track-remainders:
     type: boolean
-    description: Required by the ZMK input listener remainder tracker.
 
   base-gain:
     type: int
-    default: 700
-    description: Low-speed gain in per-mille units.
+    default: 800
+    description: Low-speed distance gain in per-mille units.
 
   max-gain:
     type: int
-    default: 4500
-    description: High-speed gain in per-mille units.
+    default: 1200
+    description: High-speed distance gain in per-mille units.
 
   acceleration-start:
     type: int
-    default: 40
-    description: Raw counts per second where acceleration begins.
+    default: 350
+    description: Raw counts per second where distance acceleration begins.
 
   acceleration-end:
     type: int
-    default: 600
-    description: Raw counts per second where maximum gain is reached.
+    default: 1500
+    description: Raw counts per second where maximum distance gain is reached.
+
+  response:
+    type: int
+    default: 18
+    description: Percentage of queued distance requested per 8 ms animation frame.
 
   input-filter-response:
     type: int
     default: 25
-    description: Percentage of a new raw target adopted by the input smoothing stage (1-100).
+    description: Percentage of target animation velocity adopted per frame.
 
-  response:
+  distance-divisor:
     type: int
-    default: 30
-    description: Percentage of target velocity adopted per 8 ms frame (1-100).
+    default: 2
+    description: Divides input distance after gain; higher values scroll less.
 
-  drag-per-mille:
+  max-velocity:
     type: int
-    default: 940
-    description: Velocity retained per 8 ms frame after input stops (0-999).
-
-  stop-threshold:
-    type: int
-    default: 150
-    description: Fixed-point velocity below which inertia stops.
-
-  input-gap-hold-ms:
-    type: int
-    default: 48
-    description: Hold the latest target velocity across brief low-speed sensor gaps.
+    default: 3
+    description: Maximum high-resolution wheel units emitted per 8 ms frame.
 
   invert-horizontal:
     type: boolean
