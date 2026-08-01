@@ -79,10 +79,6 @@ static int32_t saturating_add(int32_t a, int32_t b) {
     return (int32_t)CLAMP((int64_t)a + b, (int64_t)INT32_MIN, (int64_t)INT32_MAX);
 }
 
-static int16_t clamp_i16(int32_t value) {
-    return (int16_t)CLAMP(value, (int32_t)INT16_MIN, (int32_t)INT16_MAX);
-}
-
 static int32_t smoothstep(int32_t x) {
     x = CLAMP(x, 0, CURVE_SCALE);
     int64_t x2 = ((int64_t)x * x) / CURVE_SCALE;
@@ -216,11 +212,19 @@ static int32_t animate_axis(struct axis_animation *axis, uint32_t now_ms,
     return 0;
 }
 
-/* Fixed-point error diffusion distributes unavoidable 1/16-notch reports evenly. */
+/* Drain at most one 1/16-notch quantum per animation frame.  Keeping the rest in
+ * the accumulator turns a burst into evenly spaced 8 ms reports without losing
+ * either completed steps or sub-step remainder. */
 static int16_t extract_output(int32_t *accumulator_fp) {
-    int32_t output = *accumulator_fp / FP_SCALE;
-    *accumulator_fp -= output * FP_SCALE;
-    return clamp_i16(output);
+    if (*accumulator_fp >= FP_SCALE) {
+        *accumulator_fp -= FP_SCALE;
+        return 1;
+    }
+    if (*accumulator_fp <= -FP_SCALE) {
+        *accumulator_fp += FP_SCALE;
+        return -1;
+    }
+    return 0;
 }
 
 /* At stages A-C, trade a small amount of distance accuracy for a bounded visual pause. */
@@ -235,11 +239,17 @@ static int16_t extract_axis_output(struct axis_animation *axis, int32_t *accumul
 
     if (input_held && axis->stage < 3 && axis->velocity_fp != 0 &&
         now_ms - axis->last_report_ms >= config->low_stage_max_gap_ms[axis->stage]) {
-        /* This is a deliberate predictive step. Discarding the remainder prevents debt
-         * from producing a long compensating pause after the early report. */
-        *accumulator_fp = 0;
+        int8_t direction = sign_i32(axis->velocity_fp);
+
+        /* Borrow one quantum from future motion.  A negative/positive accumulator
+         * afterwards is the exact debt, so later frames repay the early report rather
+         * than silently creating distance.  Do not borrow again while debt remains. */
+        if (sign_i32(*accumulator_fp) != direction) {
+            return 0;
+        }
+        *accumulator_fp -= direction * FP_SCALE;
         axis->last_report_ms = now_ms;
-        return sign_i32(axis->velocity_fp);
+        return direction;
     }
     return 0;
 }
