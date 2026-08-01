@@ -45,17 +45,97 @@ LOG_MODULE_REGISTER(
 
 /* Final FLICK screen movement = 1/3. */
 #define NURUNURU_FLICK_OUTPUT_NUMERATOR 1
-#define NURUNURU_FLICK_OUTPUT_DENOMINATOR 3
+#define NURUNURU_FLICK_OUTPUT_DENOMINATOR 5
 
 /* -------------------------------------------------------------------------- */
 /* Gesture detection                                                         */
 /* -------------------------------------------------------------------------- */
 
-#define NURUNURU_ROLL_DETECT_FRAMES 6
 #define NURUNURU_FLICK_SPEED_THRESHOLD 8
 #define NURUNURU_ROLL_MAX_SPEED 5
 #define NURUNURU_ROLL_MAX_PEAK_SPEED 7
 #define NURUNURU_UNDECIDED_TIMEOUT_FRAMES 12
+
+/*
+ * ROLLING session detection.
+ *
+ * Three same-direction low-speed pulses inside 200 ms are treated as one
+ * continuous rolling gesture, even if zero-input frames occur between them.
+ */
+#define NURUNURU_ROLL_SESSION_TIMEOUT_MS 200
+#define NURUNURU_ROLL_SESSION_REQUIRED_PULSES 3
+
+static void update_rolling_session(
+    struct scroll_nurunuru_data *data,
+    int32_t frame_horizontal,
+    int32_t frame_vertical,
+    int32_t speed,
+    uint32_t now_ms
+) {
+    if (speed <= 0 || speed > NURUNURU_ROLL_MAX_SPEED) {
+        data->rolling_session_pulses = 0;
+        data->rolling_session_horizontal_direction = 0;
+        data->rolling_session_vertical_direction = 0;
+        return;
+    }
+
+    int8_t horizontal_direction =
+        sign_i32(frame_horizontal);
+
+    int8_t vertical_direction =
+        sign_i32(frame_vertical);
+
+    bool session_expired =
+        (
+            now_ms -
+            data->rolling_session_last_pulse_ms
+        ) > NURUNURU_ROLL_SESSION_TIMEOUT_MS;
+
+    bool horizontal_changed =
+        horizontal_direction != 0 &&
+        data->rolling_session_horizontal_direction != 0 &&
+        horizontal_direction !=
+            data->rolling_session_horizontal_direction;
+
+    bool vertical_changed =
+        vertical_direction != 0 &&
+        data->rolling_session_vertical_direction != 0 &&
+        vertical_direction !=
+            data->rolling_session_vertical_direction;
+
+    if (
+        session_expired ||
+        horizontal_changed ||
+        vertical_changed
+    ) {
+        data->rolling_session_pulses = 0;
+    }
+
+    if (horizontal_direction != 0) {
+        data->rolling_session_horizontal_direction =
+            horizontal_direction;
+    }
+
+    if (vertical_direction != 0) {
+        data->rolling_session_vertical_direction =
+            vertical_direction;
+    }
+
+    data->rolling_session_last_pulse_ms = now_ms;
+
+    if (data->rolling_session_pulses < UINT8_MAX) {
+        data->rolling_session_pulses++;
+    }
+}
+
+static bool rolling_session_is_ready(
+    const struct scroll_nurunuru_data *data,
+    int32_t peak_speed
+) {
+    return data->rolling_session_pulses >=
+               NURUNURU_ROLL_SESSION_REQUIRED_PULSES &&
+           peak_speed <= NURUNURU_ROLL_MAX_PEAK_SPEED;
+}
 
 /* -------------------------------------------------------------------------- */
 /* ROLLING engine                                                             */
@@ -65,7 +145,7 @@ LOG_MODULE_REGISTER(
  * One brief zero-input gap is common at low speed. Keep the last stable
  * ROLLING target for 48 ms instead of exposing that gap to the screen.
  */
-#define NURUNURU_ROLLING_GAP_HOLD_MS 48
+#define NURUNURU_ROLLING_GAP_HOLD_MS 200
 
 /*
  * Input increases should remain responsive; decreases are hidden more
@@ -171,6 +251,14 @@ struct scroll_nurunuru_data {
     int32_t rolling_hold_horizontal_fp;
     int32_t rolling_hold_vertical_fp;
     uint32_t rolling_last_nonzero_ms;
+
+    /*
+     * Same-direction pulse session detector for ultra-low-speed rolling.
+     */
+    uint8_t rolling_session_pulses;
+    int8_t rolling_session_horizontal_direction;
+    int8_t rolling_session_vertical_direction;
+    uint32_t rolling_session_last_pulse_ms;
 
     /* ROLLING release bridge. */
     bool rolling_bridge_active;
@@ -523,19 +611,13 @@ static enum scroll_nurunuru_mode classify_gesture(
     }
 
     if (
-        gesture_frames >= NURUNURU_ROLL_DETECT_FRAMES &&
-        current_speed <= NURUNURU_ROLL_MAX_SPEED &&
-        peak_speed <= NURUNURU_ROLL_MAX_PEAK_SPEED
-    ) {
-        return NURUNURU_MODE_ROLLING;
-    }
-
-    if (
         gesture_frames >=
         NURUNURU_UNDECIDED_TIMEOUT_FRAMES
     ) {
         return NURUNURU_MODE_FLICK;
     }
+
+    ARG_UNUSED(peak_speed);
 
     return NURUNURU_MODE_UNDECIDED;
 }
@@ -827,6 +909,11 @@ static void reset_gesture_state(
     data->rolling_hold_horizontal_fp = 0;
     data->rolling_hold_vertical_fp = 0;
     data->rolling_last_nonzero_ms = 0;
+
+    data->rolling_session_pulses = 0;
+    data->rolling_session_horizontal_direction = 0;
+    data->rolling_session_vertical_direction = 0;
+    data->rolling_session_last_pulse_ms = 0;
 }
 
 static void reset_bridge_state(
@@ -1018,6 +1105,14 @@ static void scroll_nurunuru_work_callback(
                     );
             }
 
+            update_rolling_session(
+                data,
+                frame_horizontal,
+                frame_vertical,
+                speed,
+                now_ms
+            );
+
             data->mode =
                 classify_gesture(
                     data->mode,
@@ -1025,6 +1120,18 @@ static void scroll_nurunuru_work_callback(
                     speed,
                     data->gesture_peak_speed
                 );
+
+            if (
+                data->mode ==
+                    NURUNURU_MODE_UNDECIDED &&
+                rolling_session_is_ready(
+                    data,
+                    data->gesture_peak_speed
+                )
+            ) {
+                data->mode =
+                    NURUNURU_MODE_ROLLING;
+            }
 
             data->output_mode =
                 data->mode == NURUNURU_MODE_ROLLING
@@ -1370,6 +1477,17 @@ static void scroll_nurunuru_work_callback(
             data->gesture_frames = 0;
             data->gesture_peak_speed = 0;
         }
+
+        if (
+            (
+                now_ms -
+                data->rolling_session_last_pulse_ms
+            ) > NURUNURU_ROLL_SESSION_TIMEOUT_MS
+        ) {
+            data->rolling_session_pulses = 0;
+            data->rolling_session_horizontal_direction = 0;
+            data->rolling_session_vertical_direction = 0;
+        }
     }
 
     data->input_was_active =
@@ -1475,10 +1593,11 @@ static void scroll_nurunuru_work_callback(
     input_device = data->input_device;
 
     LOG_DBG(
-        "raw=(%ld,%ld) mode=%u gap=%u speed=%ld gain=%ld bridge=%u velocity=(%ld,%ld) output=(%d,%d)",
+        "raw=(%ld,%ld) mode=%u session=%u gap=%u speed=%ld gain=%ld bridge=%u velocity=(%ld,%ld) output=(%d,%d)",
         (long)frame_horizontal,
         (long)frame_vertical,
         data->mode,
+        data->rolling_session_pulses,
         rolling_gap_hold_active,
         (long)speed,
         (long)gain_scaled,
@@ -1622,6 +1741,11 @@ static int scroll_nurunuru_init(
     data->rolling_hold_horizontal_fp = 0;
     data->rolling_hold_vertical_fp = 0;
     data->rolling_last_nonzero_ms = 0;
+
+    data->rolling_session_pulses = 0;
+    data->rolling_session_horizontal_direction = 0;
+    data->rolling_session_vertical_direction = 0;
+    data->rolling_session_last_pulse_ms = 0;
 
     reset_bridge_state(data);
 
