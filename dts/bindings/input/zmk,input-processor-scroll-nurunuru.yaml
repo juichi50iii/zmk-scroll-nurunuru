@@ -44,10 +44,10 @@ properties:
     type: int
     default: 60
     description: Percentage of target velocity adopted per frame below 0.25 units.
-  coast-ms:
+  launch-ms:
     type: int
-    default: 520
-    description: Duration of the zero-slope smootherstep release curve.
+    default: 96
+    description: Time spent in stage A before stage B becomes the minimum live speed.
   release-ms:
     type: int
     default: 48
@@ -68,6 +68,10 @@ properties:
     type: array
     required: true
     description: Maximum time without a report at stages A, B, and C before one predictive step.
+  stage-coast-ms:
+    type: array
+    required: true
+    description: Seven stage-specific coast durations; zero disables coasting for that stage.
   invert-horizontal:
     type: boolean
   invert-vertical:

@@ -31,12 +31,13 @@ struct scroll_nurunuru_config {
     uint16_t max_velocity_per_mille;
     uint16_t coast_velocity_per_mille;
     uint8_t low_speed_response;
-    uint16_t coast_ms;
+    uint16_t launch_ms;
     uint16_t release_ms;
     uint16_t stage_thresholds[STAGE_THRESHOLD_COUNT];
     uint16_t stage_velocities_per_mille[STAGE_COUNT];
     uint16_t stage_hysteresis_per_mille;
     uint16_t low_stage_max_gap_ms[3];
+    uint16_t stage_coast_ms[STAGE_COUNT];
     bool invert_horizontal;
     bool invert_vertical;
 };
@@ -50,6 +51,8 @@ struct axis_animation {
     bool coasting;
     uint8_t stage;
     bool stage_initialized;
+    uint8_t effective_stage;
+    uint32_t motion_started_ms;
     uint32_t last_report_ms;
 };
 
@@ -143,14 +146,9 @@ static void accept_axis_input(struct axis_animation *axis, int32_t raw_delta, ui
                                                : now_ms - axis->last_input_ms;
     dt_ms = CLAMP(dt_ms, 1U, (uint32_t)MAX_SAMPLE_MS);
     int32_t speed = (int32_t)(((int64_t)abs_i32(raw_delta) * 1000) / dt_ms);
-    uint8_t stage = select_stage(axis, speed, config);
-    int32_t target = (int32_t)(((int64_t)config->stage_velocities_per_mille[stage] *
-                                FP_SCALE) /
-                               CURVE_SCALE) *
-                     sign_i32(raw_delta);
-
+    uint8_t measured_stage = select_stage(axis, speed, config);
     bool reversing = axis->velocity_fp != 0 &&
-                     sign_i32(target) != sign_i32(axis->velocity_fp);
+                     sign_i32(raw_delta) != sign_i32(axis->velocity_fp);
     bool starting = axis->last_input_ms == 0 || axis->coasting;
 
     if (reversing) {
@@ -158,6 +156,17 @@ static void accept_axis_input(struct axis_animation *axis, int32_t raw_delta, ui
         axis->target_fp = 0;
         starting = true;
     }
+
+    if (starting) {
+        axis->motion_started_ms = now_ms;
+    }
+
+    bool launching = now_ms - axis->motion_started_ms < config->launch_ms;
+    axis->effective_stage = launching ? 0 : MAX(measured_stage, 1);
+    int32_t target = (int32_t)(((int64_t)config->stage_velocities_per_mille[
+                                    axis->effective_stage] * FP_SCALE) /
+                               CURVE_SCALE) *
+                     sign_i32(raw_delta);
 
     if (starting) {
         axis->coasting = false;
@@ -187,6 +196,16 @@ static int32_t animate_axis(struct axis_animation *axis, uint32_t now_ms,
     }
 
     if (!axis->coasting && axis->velocity_fp != 0) {
+        uint16_t coast_ms = config->stage_coast_ms[axis->effective_stage];
+        if (coast_ms == 0) {
+            axis->velocity_fp = 0;
+            axis->target_fp = 0;
+            axis->last_input_ms = 0;
+            axis->stage_initialized = false;
+            axis->last_report_ms = 0;
+            axis->motion_started_ms = 0;
+            return 0;
+        }
         axis->coasting = true;
         axis->coast_started_ms = now_ms;
         axis->release_velocity_fp =
@@ -195,18 +214,20 @@ static int32_t animate_axis(struct axis_animation *axis, uint32_t now_ms,
     }
 
     if (axis->coasting) {
+        uint16_t coast_ms = config->stage_coast_ms[axis->effective_stage];
         uint32_t elapsed = now_ms - axis->coast_started_ms;
-        if (config->coast_ms == 0 || elapsed >= config->coast_ms) {
+        if (elapsed >= coast_ms) {
             axis->velocity_fp = 0;
             axis->target_fp = 0;
             axis->last_input_ms = 0;
             axis->coasting = false;
             axis->stage_initialized = false;
             axis->last_report_ms = 0;
+            axis->motion_started_ms = 0;
             return 0;
         }
 
-        int32_t progress = (int32_t)((elapsed * CURVE_SCALE) / config->coast_ms);
+        int32_t progress = (int32_t)((elapsed * CURVE_SCALE) / coast_ms);
         axis->velocity_fp = (int32_t)(((int64_t)axis->release_velocity_fp *
                                        (CURVE_SCALE - smootherstep(progress))) /
                                       CURVE_SCALE);
@@ -233,8 +254,9 @@ static int16_t extract_axis_output(struct axis_animation *axis, int32_t *accumul
         return output;
     }
 
-    if (input_held && axis->stage < 3 && axis->velocity_fp != 0 &&
-        now_ms - axis->last_report_ms >= config->low_stage_max_gap_ms[axis->stage]) {
+    if (input_held && axis->effective_stage < 3 && axis->velocity_fp != 0 &&
+        now_ms - axis->last_report_ms >=
+            config->low_stage_max_gap_ms[axis->effective_stage]) {
         /* This is a deliberate predictive step. Discarding the remainder prevents debt
          * from producing a long compensating pause after the early report. */
         *accumulator_fp = 0;
@@ -366,7 +388,7 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
         .coast_velocity_per_mille =                                               \
             DT_INST_PROP(inst, coast_velocity_per_mille),                         \
         .low_speed_response = DT_INST_PROP(inst, low_speed_response),             \
-        .coast_ms = DT_INST_PROP(inst, coast_ms),                                 \
+        .launch_ms = DT_INST_PROP(inst, launch_ms),                               \
         .release_ms = DT_INST_PROP(inst, release_ms),                             \
         .stage_thresholds = {                                                     \
             DT_INST_PROP_BY_IDX(inst, stage_thresholds, 0),                       \
@@ -391,6 +413,15 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
             DT_INST_PROP_BY_IDX(inst, low_stage_max_gap_ms, 0),                   \
             DT_INST_PROP_BY_IDX(inst, low_stage_max_gap_ms, 1),                   \
             DT_INST_PROP_BY_IDX(inst, low_stage_max_gap_ms, 2),                   \
+        },                                                                        \
+        .stage_coast_ms = {                                                       \
+            DT_INST_PROP_BY_IDX(inst, stage_coast_ms, 0),                         \
+            DT_INST_PROP_BY_IDX(inst, stage_coast_ms, 1),                         \
+            DT_INST_PROP_BY_IDX(inst, stage_coast_ms, 2),                         \
+            DT_INST_PROP_BY_IDX(inst, stage_coast_ms, 3),                         \
+            DT_INST_PROP_BY_IDX(inst, stage_coast_ms, 4),                         \
+            DT_INST_PROP_BY_IDX(inst, stage_coast_ms, 5),                         \
+            DT_INST_PROP_BY_IDX(inst, stage_coast_ms, 6),                         \
         },                                                                        \
         .invert_horizontal = DT_INST_PROP_OR(inst, invert_horizontal, false),     \
         .invert_vertical = DT_INST_PROP_OR(inst, invert_vertical, false),         \
