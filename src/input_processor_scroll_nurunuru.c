@@ -25,6 +25,7 @@ struct scroll_nurunuru_config {
     uint16_t max_gain;
     uint16_t acceleration_start;
     uint16_t acceleration_end;
+    uint8_t input_filter_response;
     uint8_t response;
     uint16_t drag_per_mille;
     uint16_t stop_threshold;
@@ -197,13 +198,29 @@ static void scroll_nurunuru_work_callback(struct k_work *work) {
                               dt_ms);
     int32_t gain = calculate_gain(config, speed);
     if (frame_horizontal != 0) {
-        data->target_horizontal_fp =
+        int32_t raw_target =
             calculate_target_velocity_fp(frame_horizontal, dt_ms, gain);
+        if (data->target_horizontal_fp != 0 &&
+            sign_i32(raw_target) != sign_i32(data->target_horizontal_fp)) {
+            data->target_horizontal_fp = raw_target;
+        } else {
+            data->target_horizontal_fp =
+                smooth_toward(data->target_horizontal_fp, raw_target,
+                              config->input_filter_response);
+        }
         data->last_horizontal_input_ms = now_ms;
     }
     if (frame_vertical != 0) {
-        data->target_vertical_fp =
+        int32_t raw_target =
             calculate_target_velocity_fp(frame_vertical, dt_ms, gain);
+        if (data->target_vertical_fp != 0 &&
+            sign_i32(raw_target) != sign_i32(data->target_vertical_fp)) {
+            data->target_vertical_fp = raw_target;
+        } else {
+            data->target_vertical_fp =
+                smooth_toward(data->target_vertical_fp, raw_target,
+                              config->input_filter_response);
+        }
         data->last_vertical_input_ms = now_ms;
     }
 
@@ -244,6 +261,10 @@ static void scroll_nurunuru_work_callback(struct k_work *work) {
     } else {
         data->worker_running = false;
         data->last_sample_ms = 0;
+        data->target_horizontal_fp = 0;
+        data->target_vertical_fp = 0;
+        data->last_horizontal_input_ms = 0;
+        data->last_vertical_input_ms = 0;
         data->output_horizontal_fp = 0;
         data->output_vertical_fp = 0;
     }
@@ -318,6 +339,7 @@ static const struct zmk_input_processor_driver_api scroll_nurunuru_driver_api = 
         .max_gain = DT_INST_PROP(inst, max_gain),                                 \
         .acceleration_start = DT_INST_PROP(inst, acceleration_start),             \
         .acceleration_end = DT_INST_PROP(inst, acceleration_end),                 \
+        .input_filter_response = DT_INST_PROP(inst, input_filter_response),       \
         .response = DT_INST_PROP(inst, response),                                 \
         .drag_per_mille = DT_INST_PROP(inst, drag_per_mille),                     \
         .stop_threshold = DT_INST_PROP(inst, stop_threshold),                     \

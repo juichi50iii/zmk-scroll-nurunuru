@@ -34,6 +34,11 @@ properties:
     default: 600
     description: Raw counts per second where maximum gain is reached.
 
+  input-filter-response:
+    type: int
+    default: 25
+    description: Percentage of a new raw target adopted by the input smoothing stage (1-100).
+
   response:
     type: int
     default: 30
